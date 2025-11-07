@@ -1,15 +1,14 @@
 {
   "name": "itplaylab-server",
   "version": "1.0.0",
-  "description": "Render 배포를 위한 최소한의 Express 서버 템플릿",
+  "type": "module",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
-  "engines": {
-    "node": ">=18"
-  },
   "dependencies": {
-    "express": "^4.18.2"
+    "express": "^4.18.2",
+    "axios": "^1.4.0",
+    "body-parser": "^1.20.2"
   }
 }
