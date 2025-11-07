@@ -1,61 +1,67 @@
 import express from "express";
-import bodyParser from "body-parser";
 import axios from "axios";
-import { GoogleGenerativeAI } from "@google/generative-ai";
 
 const app = express();
-const PORT = process.env.PORT || 10000;
+app.use(express.json());
 
-// 환경 변수
+// ✅ 환경변수 불러오기
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 
-// 기본 설정
-app.use(bodyParser.json());
-
-// ✅ Gemini API 초기화
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-
-// ✅ 텔레그램 Webhook 엔드포인트
+// ✅ 텔레그램 메세지 처리 엔드포인트
 app.post("/webhook", async (req, res) => {
   try {
     const message = req.body.message;
-    if (!message || !message.text) {
+    if (!message || !message.text) return res.sendStatus(200);
+
+    const chatId = message.chat.id;
+    const userText = message.text.trim();
+
+    // /start 명령어 처리
+    if (userText === "/start") {
+      await axios.post(`${TELEGRAM_API}/sendMessage`, {
+        chat_id: chatId,
+        text: "안녕하세요! 👋 ItplayLab ChatGPT 봇입니다. 자유롭게 질문해보세요!",
+      });
       return res.sendStatus(200);
     }
 
-    const chatId = message.chat.id;
-    const userMessage = message.text;
+    // ✅ OpenAI ChatGPT API 호출
+    const response = await axios.post(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        model: "gpt-5",
+        messages: [
+          { role: "system", content: "You are a helpful assistant." },
+          { role: "user", content: userText },
+        ],
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
 
-    // Gemini 응답 생성
-    const result = await model.generateContent(userMessage);
-    const replyText = result.response.text();
+    const reply = response.data.choices[0].message.content;
 
-    // 텔레그램으로 응답 전송
-    await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
+    // ✅ 텔레그램에 응답 전송
+    await axios.post(`${TELEGRAM_API}/sendMessage`, {
       chat_id: chatId,
-      text: replyText,
+      text: reply,
     });
 
     res.sendStatus(200);
-  } catch (err) {
-    console.error("Webhook handler error:", err?.response?.data || err.message);
-    res.sendStatus(200);
-  }
-});
-
-// ✅ Gemini 연결 테스트용 엔드포인트
-app.get("/test-gemini", async (req, res) => {
-  try {
-    const testResult = await model.generateContent("Hello from Gemini test");
-    res.send(testResult.response.text());
   } catch (error) {
-    res.status(500).send("Gemini 연결 오류: " + error.message);
+    console.error("Webhook Error:", error.response?.data || error.message);
+    res.sendStatus(200);
   }
 });
 
 // ✅ 서버 시작
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`✅ Server is running on port ${PORT}`);
 });
