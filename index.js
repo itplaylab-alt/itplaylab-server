@@ -133,3 +133,15 @@ app.post("/webhook", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`✅ Server is running on port ${PORT}`);
 });
+// ✅ Gemini 연결 테스트용 endpoint
+app.get("/test-gemini", async (req, res) => {
+  try {
+    const { GoogleGenerativeAI } = await import("@google/generative-ai");
+    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+    const model = genAI.getGenerativeModel({ model: "gemini-pro" });
+    const result = await model.generateContent("Hello from Gemini test");
+    res.send(result.response.text());
+  } catch (error) {
+    res.status(500).send("Gemini 연결 오류: " + error.message);
+  }
+});
