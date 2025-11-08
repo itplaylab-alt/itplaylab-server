@@ -4,12 +4,23 @@ import axios from "axios";
 const app = express();
 app.use(express.json());
 
-// ✅ 환경변수 불러오기
+// 🔹 환경변수 불러오기
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const SHEETS_WEBHOOK_URL = process.env.SHEETS_WEBHOOK_URL; // ✅ Google Sheet용 URL 추가
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 
-// ✅ 텔레그램 메세지 처리 엔드포인트
+// ✅ Google Sheets로 로그 전송 함수
+async function logToGoogleSheet(data) {
+  try {
+    await axios.post(SHEETS_WEBHOOK_URL, data);
+    console.log("✅ Google Sheets로 로그 전송 성공");
+  } catch (error) {
+    console.error("❌ Google Sheets 전송 실패:", error.message);
+  }
+}
+
+// 🔹 텔레그램 메시지 처리
 app.post("/webhook", async (req, res) => {
   try {
     const message = req.body.message;
@@ -18,7 +29,18 @@ app.post("/webhook", async (req, res) => {
     const chatId = message.chat.id;
     const userText = message.text.trim();
 
-    // /start 명령어 처리
+    // 🔸 Google Sheet로 대화 내용 전송
+    await logToGoogleSheet({
+      chat_id: chatId,
+      username: message.from.username,
+      type: "text",
+      input_text: userText,
+      output_text: "응답 준비중",
+      meta: {},
+      source: "telegram",
+    });
+
+    // 🔹 /start 명령어 처리
     if (userText === "/start") {
       await axios.post(`${TELEGRAM_API}/sendMessage`, {
         chat_id: chatId,
@@ -27,41 +49,20 @@ app.post("/webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // ✅ OpenAI ChatGPT API 호출
-    const response = await axios.post(
-      "https://api.openai.com/v1/chat/completions",
-      {
-        model: "gpt-5",
-        messages: [
-          { role: "system", content: "You are a helpful assistant." },
-          { role: "user", content: userText },
-        ],
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${OPENAI_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-      }
-    );
-
-    const reply = response.data.choices[0].message.content;
-
-    // ✅ 텔레그램에 응답 전송
+    // 🔹 일반 메시지 처리
     await axios.post(`${TELEGRAM_API}/sendMessage`, {
       chat_id: chatId,
-      text: reply,
+      text: `당신이 보낸 메시지: ${userText}`,
     });
 
-    res.sendStatus(200);
+    return res.sendStatus(200);
   } catch (error) {
-    console.error("Webhook Error:", error.response?.data || error.message);
-    res.sendStatus(200);
+    console.error("❌ Error:", error.message);
+    res.sendStatus(500);
   }
 });
 
-// ✅ 서버 시작
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log(`✅ Server is running on port ${PORT}`);
+// 🔹 서버 실행
+app.listen(10000, () => {
+  console.log("✅ Server is running on port 10000");
 });
