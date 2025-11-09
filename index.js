@@ -22,6 +22,32 @@ app.get("/test/healthcheck", (req, res) => {
   });
 });
 
+// ✅ 테스트용 로그 전송 (Render → GAS 직접 테스트)
+app.get("/test/send-log", async (req, res) => {
+  try {
+    const testPayload = {
+      token: INGEST_TOKEN,
+      contents: JSON.stringify({
+        timestamp: new Date().toISOString(),
+        chat_id: "TEST_RENDER",
+        username: "render_system",
+        type: "test_log",
+        input_text: "Render → GAS 연결 테스트",
+        output_text: "✅ Render 서버에서 로그 전송 성공!",
+        source: "Render",
+        note: "자동 테스트",
+      }),
+    };
+
+    await axios.post(GAS_INGEST_URL, testPayload);
+    console.log("✅ 테스트 로그 전송 성공!");
+    res.json({ ok: true, sent_to_gas: true });
+  } catch (error) {
+    console.error("❌ 테스트 전송 실패:", error.message);
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
 // ✅ Telegram 메시지 수신 (Webhook 엔드포인트)
 app.post("/", async (req, res) => {
   try {
