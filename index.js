@@ -4,70 +4,71 @@ import axios from "axios";
 const app = express();
 app.use(express.json());
 
-// ===== ENV =====
-const TELEGRAM_TOKEN  = process.env.TELEGRAM_TOKEN;
-const TELEGRAM_ADMIN  = process.env.TELEGRAM_ADMIN_CHAT_ID; // 관리자 채팅 ID
-const NOTIFY_LEVEL    = (process.env.NOTIFY_LEVEL || "success,error,approval")
-                          .split(",").map(s => s.trim().toLowerCase());
-const GAS_INGEST_URL  = process.env.GAS_INGEST_URL;
-const INGEST_TOKEN    = process.env.INGEST_TOKEN;
+// ========== ENV ==========
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
+const TELEGRAM_ADMIN_CHAT_ID = process.env.TELEGRAM_ADMIN_CHAT_ID; // 예: 6585425777
+const NOTIFY_LEVEL = (process.env.NOTIFY_LEVEL || "success,error,approval")
+  .split(",")
+  .map(s => s.trim().toLowerCase());
+
+const GAS_INGEST_URL = process.env.GAS_INGEST_URL;
+const INGEST_TOKEN = process.env.INGEST_TOKEN;
 
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 
-// ===== helpers =====
-async function sendTelegram(chatId, text, parse_mode = "HTML") {
-  if (!chatId) return;
-  try {
-    await axios.post(`${TELEGRAM_API}/sendMessage`, {
-      chat_id: chatId,
-      text,
-      parse_mode,
-      disable_web_page_preview: true,
-    });
-  } catch (e) {
-    console.error("sendTelegram error:", e.message);
-  }
-}
-
-function shouldNotify(type) {
-  return NOTIFY_LEVEL.includes(String(type || "").toLowerCase());
-}
-
-function fmtMsg(type, data = {}) {
-  const label = {
-    success: "✅ 완료",
-    error: "⚠️ 오류",
-    approval: "🕒 승인 요청",
-  }[type] || "ℹ️ 안내";
-
-  const lines = [
-    `<b>[${label}]</b> ${data.title || data.job_id || ""}`.trim(),
-    data.message ? `• ${data.message}` : "",
-    data.link ? `🔗 <a href="${data.link}">열기</a>` : "",
-    data.detail ? `\n${data.detail}` : "",
-  ].filter(Boolean);
-
-  return lines.join("\n");
-}
-
-async function notify(type, data = {}) {
-  if (!shouldNotify(type)) return;
-  await sendTelegram(TELEGRAM_ADMIN, fmtMsg(type, data));
-}
-
-async function logToGAS(payload) {
-  if (!GAS_INGEST_URL) return;
+// 공통: GAS 로깅
+async function logToSheet(payload) {
+  const t0 = Date.now();
   try {
     await axios.post(GAS_INGEST_URL, {
       token: INGEST_TOKEN,
-      contents: JSON.stringify(payload),
+      contents: JSON.stringify({
+        timestamp: new Date().toISOString(),
+        chat_id: String(payload.chat_id ?? "system"),
+        username: String(payload.username ?? "render_system"),
+        type: String(payload.type ?? "system_log"),
+        input_text: String(payload.input_text ?? ""),
+        output_text: String(payload.output_text ?? ""),
+        source: String(payload.source ?? "Render"),
+        note: String(payload.note ?? ""),
+        project: String(payload.project ?? "itplaylab"),
+        category: String(payload.category ?? "system"),
+      }),
     });
   } catch (e) {
-    console.error("logToGAS error:", e.message);
+    console.error("❌ GAS log fail:", e?.message);
+  } finally {
+    payload.latency_ms = Date.now() - t0;
   }
 }
 
-// ===== health =====
+// 공통: 텔레그램 전송
+async function tgSend(chatId, text, parse_mode = "HTML") {
+  return axios.post(`${TELEGRAM_API}/sendMessage`, {
+    chat_id: chatId,
+    text,
+    parse_mode,
+    disable_web_page_preview: true,
+  });
+}
+
+// 메시지 포맷
+function buildNotifyMessage({ type, title, message }) {
+  const ts = new Date().toLocaleString("ko-KR", { timeZone: "Asia/Seoul" });
+
+  if (type === "success") {
+    return `✅ <b>${title || "성공"}</b>\n${message || ""}\n\n⏱ ${ts}`;
+  }
+  if (type === "error") {
+    return `❌ <b>${title || "오류"}</b>\n${message || ""}\n\n⏱ ${ts}`;
+  }
+  if (type === "approval") {
+    return `🟡 <b>${title || "승인 요청"}</b>\n${message || ""}\n\n⏱ ${ts}`;
+  }
+  return `ℹ️ <b>${title || "알림"}</b>\n${message || ""}\n\n⏱ ${ts}`;
+}
+
+// ========== 헬스체크 ==========
 app.get("/test/healthcheck", (req, res) => {
   res.json({
     ok: true,
@@ -77,95 +78,102 @@ app.get("/test/healthcheck", (req, res) => {
   });
 });
 
-// ===== test: send log to GAS =====
+// ========== GAS 연결 테스트 ==========
 app.get("/test/send-log", async (req, res) => {
   try {
-    await logToGAS({
-      timestamp: new Date().toISOString(),
-      chat_id: "TEST_RENDER",
-      username: "render_system",
+    const payload = {
       type: "test_log",
       input_text: "Render → GAS 연결 테스트",
       output_text: "✅ Render 서버에서 로그 전송 성공!",
-      source: "Render",
-      note: "자동 테스트",
-    });
-    console.log("✅ 테스트 로그 전송 성공!");
+      project: "itplaylab",
+      category: "system",
+    };
+    await logToSheet(payload);
     res.json({ ok: true, sent_to_gas: true });
-  } catch (error) {
-    console.error("❌ 테스트 전송 실패:", error.message);
-    res.status(500).json({ ok: false, error: error.message });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message });
   }
 });
 
-// ===== test: notify (success / error / approval) =====
+// ========== 알림 전송 테스트 ==========
 app.get("/test/notify", async (req, res) => {
   try {
-    const type = (req.query.type || "success").trim().toLowerCase();
-    const msg = {
-      job_id: "JOB-" + Date.now(),
-      title: req.query.title || "테스트 작업",
-      message: req.query.message || `테스트 알림 (${type})`,
-      link: req.query.link || "",
-    };
-    await notify(type, msg);
-    res.json({ ok: true, notified: shouldNotify(type), type });
-  } catch (error) {
-    res.status(500).json({ ok: false, error: error.message });
+    const type = String(req.query.type || "success").toLowerCase();
+    const title = String(req.query.title || "");
+    const message = String(req.query.message || "");
+
+    // 필터링 (환경변수 NOTIFY_LEVEL에 포함된 타입만 전송)
+    if (!NOTIFY_LEVEL.includes(type)) {
+      return res.json({ ok: true, sent: false, reason: "filtered_by_NOTIFY_LEVEL" });
+    }
+
+    const text = buildNotifyMessage({ type, title, message });
+    await tgSend(TELEGRAM_ADMIN_CHAT_ID, text);
+
+    // 로그
+    await logToSheet({
+      type: `notify_${type}`,
+      input_text: title,
+      output_text: message,
+      project: "itplaylab",
+      category: "notify",
+      note: "notify_test",
+    });
+
+    res.json({ ok: true, sent: true, type });
+  } catch (e) {
+    console.error("❌ notify error:", e?.message);
+    res.status(500).json({ ok: false, error: e?.message });
   }
 });
 
-// ===== Telegram webhook (OpenAI는 나중에) =====
+// ========== Telegram Webhook (실사용) ==========
 app.post("/", async (req, res) => {
   try {
     const message = req.body?.message;
     if (!message || !message.text) return res.sendStatus(200);
 
     const chatId = message.chat.id;
-    const user   = message.from?.username || "";
-    const text   = (message.text || "").trim();
+    const text = message.text;
 
-    // 운영용 테스트 명령
-    if (text === "/approve") {
-      await notify("approval", { title: "콘텐츠 초안 승인 필요", message: "브리프 확인 후 승인해주세요." });
-      await sendTelegram(chatId, "승인 요청을 관리자에게 보냈습니다.");
-      return res.sendStatus(200);
-    }
-    if (text === "/ok") {
-      await notify("success", { title: "제작 파이프라인", message: "작업 성공적으로 완료" });
-      await sendTelegram(chatId, "완료 알림이 전송되었습니다.");
-      return res.sendStatus(200);
-    }
-    if (text === "/fail") {
-      await notify("error", { title: "제작 파이프라인", message: "작업 실패. 재시도 예정" });
-      await sendTelegram(chatId, "오류 알림이 전송되었습니다.");
-      return res.sendStatus(200);
-    }
+    // 1) 에코 회신
+    await tgSend(chatId, `당신이 보낸 메시지: ${text}`, "HTML");
 
-    // 기본 Echo (OpenAI 연동 전)
-    const answer = `당신이 보낸 메시지: ${text}`;
-    await sendTelegram(chatId, answer);
-
-    await logToGAS({
-      timestamp: new Date().toISOString(),
+    // 2) 로그 저장
+    await logToSheet({
       chat_id: chatId,
-      username: user,
+      username: message.from?.username || "",
       type: "telegram_text",
       input_text: text,
-      output_text: answer,
-      source: "Render",
+      output_text: `당신이 보낸 메시지: ${text}`,
+      project: "itplaylab",
+      category: "chat",
       note: "",
     });
 
     res.sendStatus(200);
-  } catch (error) {
-    await notify("error", { title: "Webhook 오류", message: error.message });
-    console.error("❌ Webhook Error:", error.message);
+  } catch (e) {
+    console.error("❌ webhook error:", e?.message);
+
+    // 오류 알림(필터 허용 시)
+    if (NOTIFY_LEVEL.includes("error")) {
+      try {
+        await tgSend(
+          TELEGRAM_ADMIN_CHAT_ID,
+          buildNotifyMessage({
+            type: "error",
+            title: "Webhook 처리 오류",
+            message: e?.message || "unknown",
+          })
+        );
+      } catch {}
+    }
+
     res.sendStatus(500);
   }
 });
 
-// ===== start =====
+// ========== START ==========
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`🚀 Server is running on port ${PORT}`);
