@@ -24,34 +24,30 @@ app.use((req, res, next) => {
    0-1) URL 개행/공백 정리 (붙여넣기 실수 방지)
 ──────────────────────────────────────────────────────────── */
 app.use((req, _res, next) => {
-  // 인코딩된 줄바꿈 제거, 말단 슬래시는 /path/ → /path 허용
   req.url = req.url.replace(/%0A|%0D/gi, "");
   next();
 });
 
 /* ────────────────────────────────────────────────────────────
-   1) 바디 파서 (JSON) — 용량 제한 및 타입 지정
+   1) 바디 파서 (JSON)
 ──────────────────────────────────────────────────────────── */
 app.use(
   express.json({
     limit: "1mb",
-    // charset이 섞여도 매칭되도록 함수 형태로 허용
     type: (req) => /application\/json/i.test(req.headers["content-type"] || ""),
   })
 );
 
-/* JSON 파싱 에러를 400으로 돌려보내기 */
+/* JSON 파싱 에러를 400으로 */
 app.use((err, req, res, next) => {
   if (err?.type === "entity.parse.failed" || err instanceof SyntaxError) {
     console.error("❌ JSON parse error:", err.message);
-    return res
-      .status(400)
-      .json({ ok: false, error: "invalid_json", detail: err.message });
+    return res.status(400).json({ ok: false, error: "invalid_json", detail: err.message });
   }
   next();
 });
 
-/* 디버그용 에코 엔드포인트 (본문/헤더 그대로 보기) */
+/* 디버그 에코 */
 app.post("/debug/echo", (req, res) => {
   console.log("[ECHO]", req.body);
   res.json({ ok: true, headers: req.headers, body: req.body });
@@ -72,7 +68,6 @@ const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
 const PROJECT = process.env.PROJECT || "itplaylab";
 const SERVICE_NAME = process.env.SERVICE_NAME || "render-bot";
-
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 
 // OpenAI Client
@@ -139,16 +134,15 @@ app.get("/test/healthcheck", (req, res) => {
 });
 
 // ========== GAS 연결 테스트 ==========
-app.get("/test/send-log", async (req, res) => {
+app.get("/test/send-log", async (_req, res) => {
   try {
-    const payload = {
+    await logToSheet({
       type: "test_log",
       input_text: "Render → GAS 연결 테스트",
       output_text: "✅ Render 서버에서 로그 전송 성공!",
       project: PROJECT,
       category: "system",
-    };
-    await logToSheet(payload);
+    });
     res.json({ ok: true, sent_to_gas: true });
   } catch (e) {
     res.status(500).json({ ok: false, error: e?.message });
@@ -161,14 +155,11 @@ app.get("/test/notify", async (req, res) => {
     const type = String(req.query.type || "success").toLowerCase();
     const title = String(req.query.title || "");
     const message = String(req.query.message || "");
-
     if (!NOTIFY_LEVEL.includes(type)) {
       return res.json({ ok: true, sent: false, reason: "filtered_by_NOTIFY_LEVEL" });
     }
-
     const text = buildNotifyMessage({ type, title, message });
     await tgSend(TELEGRAM_ADMIN_CHAT_ID, text);
-
     await logToSheet({
       type: `notify_${type}`,
       input_text: title,
@@ -177,7 +168,6 @@ app.get("/test/notify", async (req, res) => {
       category: "notify",
       note: "notify_test",
     });
-
     res.json({ ok: true, sent: true, type });
   } catch (e) {
     console.error("❌ notify error:", e?.message);
@@ -204,24 +194,11 @@ app.post("/", async (req, res) => {
       output_text: `당신이 보낸 메시지: ${text}`,
       project: PROJECT,
       category: "chat",
-      note: "",
     });
 
     res.sendStatus(200);
   } catch (e) {
     console.error("❌ webhook error:", e?.message);
-    if (NOTIFY_LEVEL.includes("error")) {
-      try {
-        await tgSend(
-          TELEGRAM_ADMIN_CHAT_ID,
-          buildNotifyMessage({
-            type: "error",
-            title: "Webhook 처리 오류",
-            message: e?.message || "unknown",
-          })
-        );
-      } catch {}
-    }
     res.sendStatus(500);
   }
 });
@@ -235,8 +212,8 @@ function requireOpenAI(res) {
   return true;
 }
 
-// 4-0) OpenAI 핑
-app.get("/test/openai", async (req, res) => {
+// OpenAI 핑
+app.get("/test/openai", async (_req, res) => {
   try {
     const r = await oa.chat.completions.create({
       model: OPENAI_MODEL,
@@ -249,12 +226,38 @@ app.get("/test/openai", async (req, res) => {
   }
 });
 
-// 4-1) 브리프 생성 (Chat Completions JSON 모드)
+/* ────────────────────────────────────────────────────────────
+   입력 정규화 유틸 (topic/title/idea.title + profile 병합)
+──────────────────────────────────────────────────────────── */
+function normalizeIdea(body = {}) {
+  // profile 프리셋 병합
+  const preset = body.profile && profiles[body.profile] ? profiles[body.profile] : {};
+  // title 우선순위: idea.title > title > topic
+  const title =
+    body?.idea?.title ??
+    body?.title ??
+    body?.topic ??
+    undefined;
+
+  const ideaMerged = {
+    ...(preset || {}),
+    ...(body.idea || {}),
+    ...(title ? { title } : {}),
+  };
+  return ideaMerged;
+}
+
+// 4-1) 브리프 생성
 app.post("/content/brief", async (req, res) => {
   if (!requireOpenAI(res)) return;
   const t0 = Date.now();
   try {
-    const idea = req.body || {};
+    const idea = {
+      // /content/brief 는 top-level title 또는 idea.title 모두 허용
+      title: req.body?.title ?? req.body?.idea?.title,
+      style: req.body?.style,
+      audience: req.body?.audience,
+    };
     if (!idea.title) {
       return res.status(400).json({ ok: false, error: "title required" });
     }
@@ -288,12 +291,12 @@ app.post("/content/brief", async (req, res) => {
 
     res.json({ ok: true, brief });
   } catch (e) {
-    console.error("openai brief error (cc):", e?.message || e);
+    console.error("openai brief error:", e?.message || e);
     res.status(500).json({ ok: false, error: "openai_error" });
   }
 });
 
-// 4-2) 스크립트 생성 (Chat Completions JSON)
+// 4-2) 스크립트 생성
 app.post("/content/script", async (req, res) => {
   if (!requireOpenAI(res)) return;
   const t0 = Date.now();
@@ -328,18 +331,17 @@ app.post("/content/script", async (req, res) => {
 
     res.json({ ok: true, script });
   } catch (e) {
-    console.error("openai script error (cc):", e?.message || e);
+    console.error("openai script error:", e?.message || e);
     res.status(500).json({ ok: false, error: "openai_error" });
   }
 });
 
-// 4-3) 썸네일/메타 생성 (Chat Completions JSON)
+// 4-3) 썸네일/메타 생성
 app.post("/content/assets", async (req, res) => {
   if (!requireOpenAI(res)) return;
   const t0 = Date.now();
   try {
     const { brief_id, script } = req.body || {};
-
     const messages = [
       {
         role: "system",
@@ -369,13 +371,13 @@ app.post("/content/assets", async (req, res) => {
 
     res.json({ ok: true, assets });
   } catch (e) {
-    console.error("openai assets error (cc):", e?.message || e);
+    console.error("openai assets error:", e?.message || e);
     res.status(500).json({ ok: false, error: "openai_error" });
   }
 });
 
 // ====== 디버그: 등록 라우트 덤프 ======
-app.get("/debug/routes", (req, res) => {
+app.get("/debug/routes", (_req, res) => {
   const routes = [];
   app._router.stack.forEach((m) => {
     if (m.route && m.route.path) {
@@ -391,7 +393,9 @@ app.post("/content/run", async (req, res) => {
   const t0 = Date.now();
   const trace_id = `trc_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
   try {
-    const { idea, mode = "full", steps = ["brief", "script", "assets"], gates = {} } = req.body || {};
+    // ▶ 입력 정규화 + profile 병합
+    const idea = normalizeIdea(req.body);
+    const { mode = "full", steps = ["brief", "script", "assets"], gates = {} } = req.body || {};
     if (!idea || !idea.title) {
       return res.status(400).json({ ok: false, error: "idea.title required", trace_id });
     }
@@ -432,7 +436,6 @@ app.post("/content/run", async (req, res) => {
         return JSON.parse(r?.choices?.[0]?.message?.content || "{}");
       });
       result.brief = cc;
-      // gates
       if (gates?.min_outline && Array.isArray(cc?.outline) && cc.outline.length < gates.min_outline) {
         return res.status(412).json({ ok: false, error: "gate_outline_failed", trace_id, brief: cc });
       }
@@ -482,11 +485,16 @@ app.post("/content/run", async (req, res) => {
   } catch (e) {
     console.error("/content/run error:", e?.message || e);
     try {
-      await logToSheet({ type: "content_run_error", input_text: req.body?.idea?.title || "", output_text: String(e?.message || e), project: PROJECT, category: "pipeline", note: "run_failed" });
+      await logToSheet({ type: "content_run_error", input_text: req.body?.idea?.title || req.body?.title || "", output_text: String(e?.message || e), project: PROJECT, category: "pipeline", note: "run_failed" });
     } catch {}
     res.status(500).json({ ok: false, error: "run_error", trace_id: `trc_${Date.now()}` });
   }
 });
+
+// 브라우저 실수 방지용 안내
+app.get("/content/run", (_req, res) =>
+  res.status(405).json({ ok: false, error: "use POST with JSON body at /content/run" })
+);
 
 // ====== 404 JSON 고정 ======
 app.use((req, res) => {
