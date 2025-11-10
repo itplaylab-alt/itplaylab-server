@@ -189,6 +189,15 @@ function parseIntentKo(textRaw = "") {
     .replace(/(브리프|기획안|스크립트|대본|썸네일|메타|전체|풀|돌려|생성|만들|뽑아|실행|해주세요|해줘|해봐|요청)/g, "")
     .replace(/profile\s*=\S+|steps\s*=\S+|notify\s*=\S+/gi, "")
     .trim();
+
+  // 🔧 꼬리 어미(해줘/만들어줘/해봐/돌려줘 …) 제거 패치
+  if (title) {
+    title = title
+      .replace(/\s*(해줘|해주세요|해줘요|해 주세요|해 주라|해줘라|해봐|만들어줘|만들어 줘|만들어주라|만들자|뽑아줘|뽑아 줘|돌려줘|돌려 줘)\s*$/i, "")
+      .replace(/\s{2,}/g, " ")
+      .trim();
+  }
+
   if (title && title.length < 2) title = undefined;
 
   // 단계 의도
