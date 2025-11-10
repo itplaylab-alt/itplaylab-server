@@ -1,4 +1,7 @@
-// index.js
+// index.js (ItplayLab)
+// - Chat Completions(JSON) 모드로 OpenAI 호출
+// - /debug/routes 추가, 404 JSON 고정
+// - URL 개행(%0A/%0D) 방지 미들웨어 추가
 
 import express from "express";
 import axios from "axios";
@@ -17,9 +20,24 @@ app.use((req, res, next) => {
 });
 
 /* ────────────────────────────────────────────────────────────
+   0-1) URL 개행/공백 정리 (붙여넣기 실수 방지)
+──────────────────────────────────────────────────────────── */
+app.use((req, _res, next) => {
+  // 인코딩된 줄바꿈 제거, 말단 슬래시는 /path/ → /path 허용
+  req.url = req.url.replace(/%0A|%0D/gi, "");
+  next();
+});
+
+/* ────────────────────────────────────────────────────────────
    1) 바디 파서 (JSON) — 용량 제한 및 타입 지정
 ──────────────────────────────────────────────────────────── */
-app.use(express.json({ limit: "1mb", type: ["application/json"] }));
+app.use(
+  express.json({
+    limit: "1mb",
+    // charset이 섞여도 매칭되도록 함수 형태로 허용
+    type: (req) => /application\/json/i.test(req.headers["content-type"] || ""),
+  })
+);
 
 /* JSON 파싱 에러를 400으로 돌려보내기 */
 app.use((err, req, res, next) => {
@@ -216,7 +234,21 @@ function requireOpenAI(res) {
   return true;
 }
 
-// 4-1) 브리프 생성
+// 4-0) OpenAI 핑
+app.get("/test/openai", async (req, res) => {
+  try {
+    const r = await oa.chat.completions.create({
+      model: OPENAI_MODEL,
+      messages: [{ role: "user", content: "ping" }],
+      max_tokens: 4,
+    });
+    res.json({ ok: true, model: OPENAI_MODEL, sample: r.choices?.[0]?.message?.content || "" });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// 4-1) 브리프 생성 (Chat Completions JSON 모드)
 app.post("/content/brief", async (req, res) => {
   if (!requireOpenAI(res)) return;
   const t0 = Date.now();
@@ -226,50 +258,23 @@ app.post("/content/brief", async (req, res) => {
       return res.status(400).json({ ok: false, error: "title required" });
     }
 
-    const response_format = {
-      type: "json_schema",
-      json_schema: {
-        name: "content_brief",
-        strict: true,
-        schema: {
-          type: "object",
-          additionalProperties: false,
-          properties: {
-            brief_id: { type: "string" },
-            idea_id: { type: "string" },
-            goal: { type: "string" },
-            key_points: { type: "array", items: { type: "string" } },
-            hook: { type: "string" },
-            outline: {
-              type: "array",
-              items: {
-                type: "object",
-                properties: { sec: { type: "number" }, beat: { type: "string" } },
-                required: ["sec", "beat"],
-              },
-            },
-            channels: { type: "array", items: { type: "string" } },
-            due_date: { type: "string" },
-            owner: { type: "string" },
-          },
-          required: ["brief_id", "goal", "outline"],
-        },
-      },
-    };
-
     const messages = [
-      { role: "system", content: "너는 콘텐츠 프로듀서다. 60초 쇼츠 중심으로 간결한 브리프를 작성하라." },
+      {
+        role: "system",
+        content:
+          "너는 콘텐츠 프로듀서다. 60초 쇼츠 중심으로 간결한 브리프를 JSON으로만 반환하라. 필드는 brief_id, idea_id, goal, key_points[], hook, outline[{sec,beat}], channels[], due_date, owner. 불필요한 텍스트 금지.",
+      },
       { role: "user", content: JSON.stringify(idea) },
     ];
 
-    const resp = await oa.responses.create({
+    const cc = await oa.chat.completions.create({
       model: OPENAI_MODEL,
-      input: messages,
-      response_format,
+      messages,
+      response_format: { type: "json_object" },
     });
 
-    const raw = resp?.output_text || "";
-    const brief = raw ? JSON.parse(raw) : { fallback: true };
+    const raw = cc?.choices?.[0]?.message?.content || "{}";
+    const brief = JSON.parse(raw);
 
     await logToSheet({
       type: "content_brief",
@@ -282,65 +287,34 @@ app.post("/content/brief", async (req, res) => {
 
     res.json({ ok: true, brief });
   } catch (e) {
-    console.error("openai brief error:", e?.message || e);
+    console.error("openai brief error (cc):", e?.message || e);
     res.status(500).json({ ok: false, error: "openai_error" });
   }
 });
 
-// 4-2) 스크립트 생성
+// 4-2) 스크립트 생성 (Chat Completions JSON)
 app.post("/content/script", async (req, res) => {
   if (!requireOpenAI(res)) return;
   const t0 = Date.now();
   try {
     const brief = req.body || {};
 
-    const response_format = {
-      type: "json_schema",
-      json_schema: {
-        name: "content_script",
-        strict: true,
-        schema: {
-          type: "object",
-          additionalProperties: false,
-          properties: {
-            brief_id: { type: "string" },
-            lang: { type: "string" },
-            shots: {
-              type: "array",
-              items: {
-                type: "object",
-                properties: {
-                  t_start: { type: "number" },
-                  t_end: { type: "number" },
-                  narration: { type: "string" },
-                  overlay_text: { type: "string" },
-                  asset_hint: { type: "string" },
-                },
-                required: ["t_start", "t_end", "narration"],
-              },
-            },
-          },
-          required: ["brief_id", "shots"],
-        },
-      },
-    };
-
     const messages = [
       {
         role: "system",
-        content: "너는 숏폼 스크립트라이터다. 총 60초, 샷당 3~6초, 문장은 짧고 명확하게.",
+        content: "너는 숏폼 스크립트라이터다. 총 60초, 샷당 3~6초, 문장은 짧고 명확하게. JSON만 반환.",
       },
       { role: "user", content: JSON.stringify(brief) },
     ];
 
-    const resp = await oa.responses.create({
+    const cc = await oa.chat.completions.create({
       model: OPENAI_MODEL,
-      input: messages,
-      response_format,
+      messages,
+      response_format: { type: "json_object" },
     });
 
-    const raw = resp?.output_text || "";
-    const script = raw ? JSON.parse(raw) : { fallback: true };
+    const raw = cc?.choices?.[0]?.message?.content || "{}";
+    const script = JSON.parse(raw);
 
     await logToSheet({
       type: "content_script",
@@ -353,55 +327,35 @@ app.post("/content/script", async (req, res) => {
 
     res.json({ ok: true, script });
   } catch (e) {
-    console.error("openai script error:", e?.message || e);
+    console.error("openai script error (cc):", e?.message || e);
     res.status(500).json({ ok: false, error: "openai_error" });
   }
 });
 
-// 4-3) 썸네일/메타 생성
+// 4-3) 썸네일/메타 생성 (Chat Completions JSON)
 app.post("/content/assets", async (req, res) => {
   if (!requireOpenAI(res)) return;
   const t0 = Date.now();
   try {
     const { brief_id, script } = req.body || {};
 
-    const response_format = {
-      type: "json_schema",
-      json_schema: {
-        name: "content_assets",
-        strict: true,
-        schema: {
-          type: "object",
-          additionalProperties: false,
-          properties: {
-            brief_id: { type: "string" },
-            thumbnail_prompt: { type: "string" },
-            titles: { type: "array", items: { type: "string" } },
-            descriptions: { type: "array", items: { type: "string" } },
-            hashtags: { type: "array", items: { type: "string" } },
-          },
-          required: ["brief_id", "thumbnail_prompt", "titles"],
-        },
-      },
-    };
-
     const messages = [
       {
         role: "system",
         content:
-          "너는 유튜브 운영자다. 썸네일 프롬프트와 제목/설명을 생성하라. 제목 3안, 해시태그 5개.",
+          "너는 유튜브 운영자다. 썸네일 프롬프트(thumbnail_prompt)와 제목(titles 3개)/설명(descriptions)/해시태그(hashtags 5개)를 JSON으로만 반환하라.",
       },
       { role: "user", content: JSON.stringify({ brief_id, script }) },
     ];
 
-    const resp = await oa.responses.create({
+    const cc = await oa.chat.completions.create({
       model: OPENAI_MODEL,
-      input: messages,
-      response_format,
+      messages,
+      response_format: { type: "json_object" },
     });
 
-    const raw = resp?.output_text || "";
-    const assets = raw ? JSON.parse(raw) : { fallback: true };
+    const raw = cc?.choices?.[0]?.message?.content || "{}";
+    const assets = JSON.parse(raw);
 
     await logToSheet({
       type: "content_assets",
@@ -414,9 +368,26 @@ app.post("/content/assets", async (req, res) => {
 
     res.json({ ok: true, assets });
   } catch (e) {
-    console.error("openai assets error:", e?.message || e);
+    console.error("openai assets error (cc):", e?.message || e);
     res.status(500).json({ ok: false, error: "openai_error" });
   }
+});
+
+// ====== 디버그: 등록 라우트 덤프 ======
+app.get("/debug/routes", (req, res) => {
+  const routes = [];
+  app._router.stack.forEach((m) => {
+    if (m.route && m.route.path) {
+      const methods = Object.keys(m.route.methods).map((x) => x.toUpperCase());
+      routes.push({ methods, path: m.route.path });
+    }
+  });
+  res.json({ ok: true, routes });
+});
+
+// ====== 404 JSON 고정 ======
+app.use((req, res) => {
+  res.status(404).json({ ok: false, error: "not_found", method: req.method, path: req.originalUrl });
 });
 
 // ========== START ==========
