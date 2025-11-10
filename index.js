@@ -1,4 +1,4 @@
-// index.js (복붙해서 교체)
+// index.js
 
 import express from "express";
 import axios from "axios";
@@ -11,9 +11,7 @@ const app = express();
 ──────────────────────────────────────────────────────────── */
 app.use((req, res, next) => {
   console.log(
-    `[REQ] ${new Date().toISOString()} ${req.method} ${req.url} ct=${
-      req.headers["content-type"] || ""
-    }`
+    `[REQ] ${new Date().toISOString()} ${req.method} ${req.url} ct=${req.headers["content-type"] || ""}`
   );
   next();
 });
@@ -36,6 +34,7 @@ app.use((err, req, res, next) => {
 
 /* 디버그용 에코 엔드포인트 (본문/헤더 그대로 보기) */
 app.post("/debug/echo", (req, res) => {
+  console.log("[ECHO]", req.body);
   res.json({ ok: true, headers: req.headers, body: req.body });
 });
 
@@ -424,13 +423,4 @@ app.post("/content/assets", async (req, res) => {
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`🚀 Server is running on port ${PORT}`);
-});
-// 🔍 디버그용 에코 엔드포인트
-app.post("/debug/echo", (req, res) => {
-  console.log("[ECHO]", req.body);
-  res.json({
-    ok: true,
-    headers: req.headers,
-    body: req.body,
-  });
 });
