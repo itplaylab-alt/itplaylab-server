@@ -2,6 +2,7 @@
 // - Chat Completions(JSON) 모드로 OpenAI 호출
 // - /debug/routes 추가, 404 JSON 고정
 // - URL 개행(%0A/%0D) 방지 미들웨어 추가
+// - 텔레그램: 자연어 파서 + 슬래시 명령(/brief, /run) 지원
 
 import express from "express";
 import axios from "axios";
@@ -175,6 +176,60 @@ app.get("/test/notify", async (req, res) => {
   }
 });
 
+/* ────────────────────────────────────────────────────────────
+   자연어 → 명령 파서 (ko)
+   - 의도(intent): brief | run_full | run_parts
+   - 슬롯(title, steps, profile, notify)
+──────────────────────────────────────────────────────────── */
+function parseIntentKo(textRaw = "") {
+  const text = String(textRaw).trim();
+  // 따옴표 안 제목 우선 추출
+  const qTitle = (text.match(/["“”](.+?)["“”]/) || [])[1];
+  let title = qTitle || text
+    .replace(/(브리프|기획안|스크립트|대본|썸네일|메타|전체|풀|돌려|생성|만들|뽑아|실행|해주세요|해줘|해봐|요청)/g, "")
+    .replace(/profile\s*=\S+|steps\s*=\S+|notify\s*=\S+/gi, "")
+    .trim();
+  if (title && title.length < 2) title = undefined;
+
+  // 단계 의도
+  const wantBrief   = /(브리프|기획안)/.test(text);
+  const wantScript  = /(스크립트|대본)/.test(text);
+  const wantAssets  = /(썸네일|타이틀|제목|설명|해시태그|메타)/.test(text);
+  const wantFull    = /(전체|풀|원스톱|한번에|End[- ]?to[- ]?End|E2E)/i.test(text);
+
+  // profile/notify 파라미터
+  let profile = (text.match(/profile\s*=\s*([^\s]+)/i) || [])[1];
+  if (!profile) {
+    if (/튜토리얼|설명형/.test(text)) profile = "shorts_tutorial_v1";
+    else if (/마케팅|프로모션|홍보/.test(text)) profile = "shorts_marketing_v1";
+  }
+  let notify;
+  if (/notify\s*=\s*false/i.test(text) || /(알림\s*끄|조용히|무음)/.test(text)) notify = false;
+  if (/notify\s*=\s*true/i.test(text)  || /(알림\s*켜|통지)/.test(text)) notify = true;
+
+  // steps= 직접 지정
+  let stepsKV = (text.match(/steps\s*=\s*([^\s]+)/i) || [])[1];
+  let steps;
+  if (stepsKV) {
+    steps = stepsKV.split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
+  } else {
+    if (wantFull) steps = ["brief", "script", "assets"];
+    else {
+      const arr = [];
+      if (wantBrief) arr.push("brief");
+      if (wantScript) arr.push("script");
+      if (wantAssets) arr.push("assets");
+      steps = arr.length ? arr : ["brief"]; // 기본: 브리프만
+    }
+  }
+
+  let intent = "run_parts";
+  if (wantFull || (steps && steps.length === 3)) intent = "run_full";
+  else if (steps.length === 1 && steps[0] === "brief") intent = "brief";
+
+  return { intent, title, steps, profile, notify, raw: text };
+}
+
 // ========== Telegram Webhook ==========
 app.post("/", async (req, res) => {
   try {
@@ -182,23 +237,101 @@ app.post("/", async (req, res) => {
     if (!message || !message.text) return res.sendStatus(200);
 
     const chatId = message.chat.id;
-    const text = message.text;
+    const text = (message.text || "").trim();
 
-    await tgSend(chatId, `당신이 보낸 메시지: ${text}`, "HTML");
+    // 1) 슬래시 명령 우선 처리 (/brief, /run, /on, /off)
+    if (text.startsWith("/")) {
+      if (text.startsWith("/on")) {
+        await tgSend(chatId, "✅ 요청 수락. (환경변수 BOT_ACTIVE=on 권장)");
+        return res.sendStatus(200);
+      }
+      if (text.startsWith("/off")) {
+        await tgSend(chatId, "🟡 대기모드 안내: (환경변수 BOT_ACTIVE=off 권장)");
+        return res.sendStatus(200);
+      }
 
-    await logToSheet({
-      chat_id: chatId,
-      username: message.from?.username || "",
-      type: "telegram_text",
-      input_text: text,
-      output_text: `당신이 보낸 메시지: ${text}`,
-      project: PROJECT,
-      category: "chat",
-    });
+      // /brief 제목
+      if (text.startsWith("/brief")) {
+        const title = text.replace(/^\/brief\s*/i, "").trim().replace(/^"(.+)"$/, "$1");
+        if (!title) { await tgSend(chatId, "❗형식: /brief 제목"); return res.sendStatus(200); }
+        await tgSend(chatId, `⏳ 브리프 생성: ${title}`);
+        const r = await axios.post(`${req.protocol}://${req.get("host")}/content/brief`, { title, style:"YouTube Shorts" });
+        await tgSend(chatId, `✅ 브리프 완료\n<pre>${JSON.stringify(r.data.brief, null, 2)}</pre>`, "HTML");
+        return res.sendStatus(200);
+      }
 
-    res.sendStatus(200);
+      // /run "제목" profile=... steps=...
+      if (text.startsWith("/run")) {
+        const raw = text.replace(/^\/run\s*/i, "");
+        const parts = raw.match(/"(.+?)"|[^\s]+/g) || [];
+        const title = (parts[0] || "").replace(/^"(.+)"$/, "$1");
+        const optsPairs = parts.slice(1).map(s => s.split("=").map(x=>x.trim())).filter(a=>a[0]&&a[1]);
+        const opts = Object.fromEntries(optsPairs);
+        const steps = (opts.steps ? opts.steps.split(/[,\s]+/).filter(Boolean) : ["brief","script","assets"]);
+        const profile = opts.profile || "shorts_marketing_v1";
+        const notify = opts.notify ? opts.notify === "true" : false;
+
+        if (!title) { await tgSend(chatId, "❗형식: /run \"제목\" profile=... steps=..."); return res.sendStatus(200); }
+
+        await tgSend(chatId, `⏳ 실행 시작\n• title: ${title}\n• profile: ${profile}\n• steps: ${steps.join(",")}`);
+        const r = await axios.post(`${req.protocol}://${req.get("host")}/content/run`, {
+          profile, idea:{ title }, steps, notify
+        });
+        const summary = {
+          trace_id: r.data.trace_id,
+          have: { brief: !!r.data.brief, script: !!r.data.script, assets: !!r.data.assets },
+          ms: Object.fromEntries(Object.entries(r.data?.metrics?.steps || {}).map(([k,v]) => [k, v.latency_ms]))
+        };
+        await tgSend(chatId, `✅ 실행 완료\n<pre>${JSON.stringify(summary, null, 2)}</pre>`, "HTML");
+        return res.sendStatus(200);
+      }
+
+      // 알 수 없는 슬래시 명령
+      await tgSend(chatId, "ℹ️ 지원 명령: /brief 제목, /run \"제목\" profile=... steps=...");
+      return res.sendStatus(200);
+    }
+
+    // 2) 자연어 명령 처리 (슬래시 없이 온 일반 문장)
+    const intent = parseIntentKo(text);
+    if (!intent.title) {
+      await tgSend(chatId, "❗제목을 인식하지 못했어요.\n예) \"AI 자동화 콘텐츠 전략\" 브리프 만들어줘");
+      await logToSheet({ chat_id: chatId, type:"nlp_parse_fail", input_text:text, output_text:"no_title", project:PROJECT, category:"chat" });
+      return res.sendStatus(200);
+    }
+
+    await tgSend(
+      chatId,
+      `🧠 해석 결과\n• intent: ${intent.intent}\n• title: ${intent.title}\n• steps: ${intent.steps.join(",")}\n• profile: ${intent.profile || "-"}\n• notify: ${String(intent.notify ?? "default")}`
+    );
+
+    if (intent.intent === "brief") {
+      const r = await axios.post(`${req.protocol}://${req.get("host")}/content/brief`, {
+        title: intent.title, style: "YouTube Shorts"
+      });
+      await tgSend(chatId, `✅ 브리프 완료\n<pre>${JSON.stringify(r.data.brief, null, 2)}</pre>`, "HTML");
+      return res.sendStatus(200);
+    }
+
+    const runBody = {
+      profile: intent.profile || "shorts_marketing_v1",
+      idea: { title: intent.title },
+      steps: intent.steps,
+      notify: intent.notify ?? false
+    };
+    const r = await axios.post(`${req.protocol}://${req.get("host")}/content/run`, runBody);
+    const summary = {
+      trace_id: r.data.trace_id,
+      have: { brief: !!r.data.brief, script: !!r.data.script, assets: !!r.data.assets },
+      ms: Object.fromEntries(Object.entries(r.data?.metrics?.steps || {}).map(([k,v]) => [k, v.latency_ms]))
+    };
+    await tgSend(chatId, `✅ 실행 완료\n<pre>${JSON.stringify(summary, null, 2)}</pre>`, "HTML");
+    return res.sendStatus(200);
+
   } catch (e) {
     console.error("❌ webhook error:", e?.message);
+    try {
+      await tgSend(TELEGRAM_ADMIN_CHAT_ID, buildNotifyMessage({ type:"error", title:"Webhook 처리 오류", message: e?.message || "unknown"}));
+    } catch {}
     res.sendStatus(500);
   }
 });
@@ -230,20 +363,9 @@ app.get("/test/openai", async (_req, res) => {
    입력 정규화 유틸 (topic/title/idea.title + profile 병합)
 ──────────────────────────────────────────────────────────── */
 function normalizeIdea(body = {}) {
-  // profile 프리셋 병합
   const preset = body.profile && profiles[body.profile] ? profiles[body.profile] : {};
-  // title 우선순위: idea.title > title > topic
-  const title =
-    body?.idea?.title ??
-    body?.title ??
-    body?.topic ??
-    undefined;
-
-  const ideaMerged = {
-    ...(preset || {}),
-    ...(body.idea || {}),
-    ...(title ? { title } : {}),
-  };
+  const title = body?.idea?.title ?? body?.title ?? body?.topic ?? undefined;
+  const ideaMerged = { ...(preset || {}), ...(body.idea || {}), ...(title ? { title } : {}) };
   return ideaMerged;
 }
 
@@ -253,7 +375,6 @@ app.post("/content/brief", async (req, res) => {
   const t0 = Date.now();
   try {
     const idea = {
-      // /content/brief 는 top-level title 또는 idea.title 모두 허용
       title: req.body?.title ?? req.body?.idea?.title,
       style: req.body?.style,
       audience: req.body?.audience,
@@ -393,7 +514,6 @@ app.post("/content/run", async (req, res) => {
   const t0 = Date.now();
   const trace_id = `trc_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
   try {
-    // ▶ 입력 정규화 + profile 병합
     const idea = normalizeIdea(req.body);
     const { mode = "full", steps = ["brief", "script", "assets"], gates = {} } = req.body || {};
     if (!idea || !idea.title) {
