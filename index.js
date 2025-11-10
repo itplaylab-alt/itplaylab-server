@@ -425,3 +425,12 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`🚀 Server is running on port ${PORT}`);
 });
+// 🔍 디버그용 에코 엔드포인트
+app.post("/debug/echo", (req, res) => {
+  console.log("[ECHO]", req.body);
+  res.json({
+    ok: true,
+    headers: req.headers,
+    body: req.body,
+  });
+});
