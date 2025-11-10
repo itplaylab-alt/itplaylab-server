@@ -1,9 +1,43 @@
+// index.js (복붙해서 교체)
+
 import express from "express";
 import axios from "axios";
 import OpenAI from "openai";
 
 const app = express();
-app.use(express.json());
+
+/* ────────────────────────────────────────────────────────────
+   0) 요청 로깅 + Content-Type 확인 (가장 위, 미들웨어들보다 먼저)
+──────────────────────────────────────────────────────────── */
+app.use((req, res, next) => {
+  console.log(
+    `[REQ] ${new Date().toISOString()} ${req.method} ${req.url} ct=${
+      req.headers["content-type"] || ""
+    }`
+  );
+  next();
+});
+
+/* ────────────────────────────────────────────────────────────
+   1) 바디 파서 (JSON) — 용량 제한 및 타입 지정
+──────────────────────────────────────────────────────────── */
+app.use(express.json({ limit: "1mb", type: ["application/json"] }));
+
+/* JSON 파싱 에러를 400으로 돌려보내기 */
+app.use((err, req, res, next) => {
+  if (err?.type === "entity.parse.failed" || err instanceof SyntaxError) {
+    console.error("❌ JSON parse error:", err.message);
+    return res
+      .status(400)
+      .json({ ok: false, error: "invalid_json", detail: err.message });
+  }
+  next();
+});
+
+/* 디버그용 에코 엔드포인트 (본문/헤더 그대로 보기) */
+app.post("/debug/echo", (req, res) => {
+  res.json({ ok: true, headers: req.headers, body: req.body });
+});
 
 // ========== ENV ==========
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
