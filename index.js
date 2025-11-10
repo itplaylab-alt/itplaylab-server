@@ -6,6 +6,7 @@
 import express from "express";
 import axios from "axios";
 import OpenAI from "openai";
+import { profiles } from "./config/profiles.js";
 
 const app = express();
 
