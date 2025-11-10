@@ -10,7 +10,7 @@ const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const TELEGRAM_ADMIN_CHAT_ID = process.env.TELEGRAM_ADMIN_CHAT_ID;
 const NOTIFY_LEVEL = (process.env.NOTIFY_LEVEL || "success,error,approval")
   .split(",")
-  .map(s => s.trim().toLowerCase());
+  .map((s) => s.trim().toLowerCase());
 
 const GAS_INGEST_URL = process.env.GAS_INGEST_URL;
 const INGEST_TOKEN = process.env.INGEST_TOKEN;
@@ -38,12 +38,16 @@ async function logToSheet(payload) {
         username: String(payload.username ?? "render_system"),
         type: String(payload.type ?? "system_log"),
         input_text: String(payload.input_text ?? ""),
-        output_text: typeof payload.output_text === "string" ? payload.output_text : JSON.stringify(payload.output_text ?? ""),
+        output_text:
+          typeof payload.output_text === "string"
+            ? payload.output_text
+            : JSON.stringify(payload.output_text ?? ""),
         source: String(payload.source ?? "Render"),
         note: String(payload.note ?? ""),
         project: String(payload.project ?? PROJECT),
         category: String(payload.category ?? "system"),
-        service: String(SERVICE_NAME)
+        service: String(SERVICE_NAME),
+        latency_ms: payload.latency_ms ?? 0,
       }),
     });
   } catch (e) {
@@ -66,7 +70,6 @@ async function tgSend(chatId, text, parse_mode = "HTML") {
 // 메시지 포맷
 function buildNotifyMessage({ type, title, message }) {
   const ts = new Date().toLocaleString("ko-KR", { timeZone: "Asia/Seoul" });
-
   if (type === "success") return `✅ <b>${title || "성공"}</b>\n${message || ""}\n\n⏱ ${ts}`;
   if (type === "error") return `❌ <b>${title || "오류"}</b>\n${message || ""}\n\n⏱ ${ts}`;
   if (type === "approval") return `🟡 <b>${title || "승인 요청"}</b>\n${message || ""}\n\n⏱ ${ts}`;
@@ -209,27 +212,27 @@ app.post("/content/brief", async (req, res) => {
               items: {
                 type: "object",
                 properties: { sec: { type: "number" }, beat: { type: "string" } },
-                required: ["sec", "beat"]
-              }
+                required: ["sec", "beat"],
+              },
             },
             channels: { type: "array", items: { type: "string" } },
             due_date: { type: "string" },
-            owner: { type: "string" }
+            owner: { type: "string" },
           },
-          required: ["brief_id", "goal", "outline"]
-        }
-      }
+          required: ["brief_id", "goal", "outline"],
+        },
+      },
     };
 
     const messages = [
       { role: "system", content: "너는 콘텐츠 프로듀서다. 60초 쇼츠 중심으로 간결한 브리프를 작성하라." },
-      { role: "user", content: JSON.stringify(idea) }
+      { role: "user", content: JSON.stringify(idea) },
     ];
 
     const resp = await oa.responses.create({
       model: OPENAI_MODEL,
       input: messages,
-      response_format
+      response_format,
     });
 
     const raw = resp?.output_text || "";
@@ -241,7 +244,7 @@ app.post("/content/brief", async (req, res) => {
       output_text: brief,
       project: PROJECT,
       category: "brief",
-      note: `via /content/brief, latency_ms=${Date.now() - t0}`
+      note: `via /content/brief, latency_ms=${Date.now() - t0}`,
     });
 
     res.json({ ok: true, brief });
@@ -278,26 +281,29 @@ app.post("/content/script", async (req, res) => {
                   t_end: { type: "number" },
                   narration: { type: "string" },
                   overlay_text: { type: "string" },
-                  asset_hint: { type: "string" }
+                  asset_hint: { type: "string" },
                 },
-                required: ["t_start", "t_end", "narration"]
-              }
-            }
+                required: ["t_start", "t_end", "narration"],
+              },
+            },
           },
-          required: ["brief_id", "shots"]
-        }
-      }
+          required: ["brief_id", "shots"],
+        },
+      },
     };
 
     const messages = [
-      { role: "system", content: "너는 숏폼 스크립트라이터다. 총 60초, 샷당 3~6초, 문장은 짧고 명확하게." },
-      { role: "user", content: JSON.stringify(brief) }
+      {
+        role: "system",
+        content: "너는 숏폼 스크립트라이터다. 총 60초, 샷당 3~6초, 문장은 짧고 명확하게.",
+      },
+      { role: "user", content: JSON.stringify(brief) },
     ];
 
     const resp = await oa.responses.create({
       model: OPENAI_MODEL,
       input: messages,
-      response_format
+      response_format,
     });
 
     const raw = resp?.output_text || "";
@@ -309,7 +315,7 @@ app.post("/content/script", async (req, res) => {
       output_text: script,
       project: PROJECT,
       category: "content",
-      note: `via /content/script, latency_ms=${Date.now() - t0}`
+      note: `via /content/script, latency_ms=${Date.now() - t0}`,
     });
 
     res.json({ ok: true, script });
@@ -339,22 +345,26 @@ app.post("/content/assets", async (req, res) => {
             thumbnail_prompt: { type: "string" },
             titles: { type: "array", items: { type: "string" } },
             descriptions: { type: "array", items: { type: "string" } },
-            hashtags: { type: "array", items: { type: "string" } }
+            hashtags: { type: "array", items: { type: "string" } },
           },
-          required: ["brief_id", "thumbnail_prompt", "titles"]
-        }
-      }
+          required: ["brief_id", "thumbnail_prompt", "titles"],
+        },
+      },
     };
 
     const messages = [
-      { role: "system", content: "너는 유튜브 운영자다. 썸네일 프롬프트와 제목/설명을 생성하라. 제목 3안, 해시태그 5개." },
-      { role: "user", content: JSON.stringify({ brief_id, script }) }
+      {
+        role: "system",
+        content:
+          "너는 유튜브 운영자다. 썸네일 프롬프트와 제목/설명을 생성하라. 제목 3안, 해시태그 5개.",
+      },
+      { role: "user", content: JSON.stringify({ brief_id, script }) },
     ];
 
     const resp = await oa.responses.create({
       model: OPENAI_MODEL,
       input: messages,
-      response_format
+      response_format,
     });
 
     const raw = resp?.output_text || "";
@@ -366,7 +376,7 @@ app.post("/content/assets", async (req, res) => {
       output_text: assets,
       project: PROJECT,
       category: "asset",
-      note: `via /content/assets, latency_ms=${Date.now() - t0}`
+      note: `via /content/assets, latency_ms=${Date.now() - t0}`,
     });
 
     res.json({ ok: true, assets });
