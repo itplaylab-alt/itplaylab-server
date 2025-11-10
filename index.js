@@ -385,6 +385,108 @@ app.get("/debug/routes", (req, res) => {
   res.json({ ok: true, routes });
 });
 
+// ====== 오케스트레이터: 전체 자동/선택 실행 ======
+app.post("/content/run", async (req, res) => {
+  const t0 = Date.now();
+  const trace_id = `trc_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  try {
+    const { idea, mode = "full", steps = ["brief", "script", "assets"], gates = {} } = req.body || {};
+    if (!idea || !idea.title) {
+      return res.status(400).json({ ok: false, error: "idea.title required", trace_id });
+    }
+    if (!OPENAI_API_KEY) {
+      return res.status(500).json({ ok: false, error: "OPENAI_API_KEY missing", trace_id });
+    }
+
+    const result = { trace_id };
+    const metrics = { steps: {}, retries: {} };
+
+    const withRetry = async (label, fn, retry = 1) => {
+      let lastErr;
+      for (let i = 0; i <= retry; i++) {
+        const s = Date.now();
+        try {
+          const out = await fn();
+          metrics.steps[label] = { ok: true, latency_ms: Date.now() - s, try: i + 1 };
+          if (i > 0) metrics.retries[label] = i;
+          return out;
+        } catch (e) {
+          lastErr = e;
+          metrics.steps[label] = { ok: false, latency_ms: Date.now() - s, try: i + 1, error: String(e?.message || e) };
+          if (i === retry) throw e;
+        }
+      }
+    };
+
+    const need = (step) => mode === "full" || steps.includes(step);
+
+    // 1) BRIEF
+    if (need("brief")) {
+      const messages = [
+        { role: "system", content: "너는 콘텐츠 프로듀서다. 60초 쇼츠 중심으로 간결한 브리프를 JSON으로만 반환하라. 필드는 brief_id, idea_id, goal, key_points[], hook, outline[{sec,beat}], channels[], due_date, owner." },
+        { role: "user", content: JSON.stringify(idea) },
+      ];
+      const cc = await withRetry("brief", async () => {
+        const r = await oa.chat.completions.create({ model: OPENAI_MODEL, messages, response_format: { type: "json_object" } });
+        return JSON.parse(r?.choices?.[0]?.message?.content || "{}");
+      });
+      result.brief = cc;
+      // gates
+      if (gates?.min_outline && Array.isArray(cc?.outline) && cc.outline.length < gates.min_outline) {
+        return res.status(412).json({ ok: false, error: "gate_outline_failed", trace_id, brief: cc });
+      }
+    }
+
+    // 2) SCRIPT
+    if (need("script")) {
+      const scriptInput = result.brief ? { brief_id: result.brief.brief_id, goal: result.brief.goal, outline: result.brief.outline, lang: "ko" } : req.body?.script_input || {};
+      const messages = [
+        { role: "system", content: "너는 숏폼 스크립트라이터다. 총 60초, 샷당 3~6초, 문장은 짧고 명확하게. JSON만 반환." },
+        { role: "user", content: JSON.stringify(scriptInput) },
+      ];
+      const cc = await withRetry("script", async () => {
+        const r = await oa.chat.completions.create({ model: OPENAI_MODEL, messages, response_format: { type: "json_object" } });
+        return JSON.parse(r?.choices?.[0]?.message?.content || "{}");
+      });
+      result.script = cc;
+      if (gates?.min_shots && Array.isArray(cc?.shots) && cc.shots.length < gates.min_shots) {
+        return res.status(412).json({ ok: false, error: "gate_shots_failed", trace_id, script: cc });
+      }
+    }
+
+    // 3) ASSETS
+    if (need("assets")) {
+      const assetsInput = { brief_id: result.brief?.brief_id || idea?.title || "brief_unknown", script: result.script || {} };
+      const messages = [
+        { role: "system", content: "너는 유튜브 운영자다. 썸네일 프롬프트(thumbnail_prompt)와 제목(titles 3개)/설명(descriptions)/해시태그(hashtags 5개)를 JSON으로만 반환하라." },
+        { role: "user", content: JSON.stringify(assetsInput) },
+      ];
+      const cc = await withRetry("assets", async () => {
+        const r = await oa.chat.completions.create({ model: OPENAI_MODEL, messages, response_format: { type: "json_object" } });
+        return JSON.parse(r?.choices?.[0]?.message?.content || "{}");
+      });
+      result.assets = cc;
+    }
+
+    await logToSheet({
+      type: "content_run",
+      input_text: idea?.title || "",
+      output_text: { trace_id, mode, steps, gates, result },
+      project: PROJECT,
+      category: "pipeline",
+      note: `via /content/run, total_ms=${Date.now() - t0}`,
+    });
+
+    res.json({ ok: true, trace_id, metrics, ...result });
+  } catch (e) {
+    console.error("/content/run error:", e?.message || e);
+    try {
+      await logToSheet({ type: "content_run_error", input_text: req.body?.idea?.title || "", output_text: String(e?.message || e), project: PROJECT, category: "pipeline", note: "run_failed" });
+    } catch {}
+    res.status(500).json({ ok: false, error: "run_error", trace_id: `trc_${Date.now()}` });
+  }
+});
+
 // ====== 404 JSON 고정 ======
 app.use((req, res) => {
   res.status(404).json({ ok: false, error: "not_found", method: req.method, path: req.originalUrl });
