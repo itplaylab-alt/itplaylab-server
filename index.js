@@ -1,8 +1,9 @@
-// index.js (ItplayLab)
+// index.js (ItplayLab • Advanced NLP ver.)
 // - Chat Completions(JSON) 모드로 OpenAI 호출
 // - /debug/routes 추가, 404 JSON 고정
 // - URL 개행(%0A/%0D) 방지 미들웨어 추가
 // - 텔레그램: 자연어 파서 + 슬래시 명령(/brief, /run) 지원
+// - 고급형 정규식 파서: 한/영 혼용 명령어, 말끝/조사/불용어/이모지/URL/해시태그/괄호주석 제거
 
 import express from "express";
 import axios from "axios";
@@ -177,66 +178,140 @@ app.get("/test/notify", async (req, res) => {
 });
 
 /* ────────────────────────────────────────────────────────────
-   자연어 → 명령 파서 (ko)
-   - 의도(intent): brief | run_full | run_parts
-   - 슬롯(title, steps, profile, notify)
+   고급형 자연어 파서 유틸
+   - 불용어/이모지/URL/멘션/해시태그/괄호주석 제거
+   - 요청형 어미·조사 꼬리 제거, 한/영 혼용 명령어 인식
 ──────────────────────────────────────────────────────────── */
-function parseIntentKo(textRaw = "") {
-  const text = String(textRaw).trim();
-  // 따옴표 안 제목 우선 추출
-  const qTitle = (text.match(/["“”](.+?)["“”]/) || [])[1];
-  let title = qTitle || text
-    .replace(/(브리프|기획안|스크립트|대본|썸네일|메타|전체|풀|돌려|생성|만들|뽑아|실행|해주세요|해줘|해봐|요청)/g, "")
-    .replace(/profile\s*=\S+|steps\s*=\S+|notify\s*=\S+/gi, "")
+const RE = {
+  url: /(https?:\/\/|www\.)\S+/gi,
+  mention: /@[a-z0-9_]+/gi,
+  hashtag: /#[^\s#]+/g,
+  brackets: /[\(\[\{（【].*?[\)\]\}）】]/g,        // (주석), [참고] 등
+  emojis: /([\u2700-\u27BF]|[\uE000-\uF8FF]|[\uD83C-\uDBFF\uDC00-\uDFFF])/g,
+  quotes: /["“”](.+?)["“”]/,                      // 인용된 제목
+  params: /(profile|steps|notify)\s*=\s*[^\s]+/gi,
+  // 문장 내 명령 단어 (양끝/중간)
+  cmdWords: /(브리프|기획안|스크립트|대본|썸네일|메타|제목|설명|해시태그|전체|풀|한번에|원스톱|e2e|end\s*to\s*end|run|generate|create|make|build|produce|script|brief)/gi,
+  // 요청형 어미(결합형 포함)
+  tailReq: new RegExp(
+    [
+      "해줘", "해주세요", "해줘요", "해 주세요", "해 주라", "해줘라", "해봐",
+      "만들어줘", "만들어 줘", "만들어주라", "만들어", "만들기", "만들자",
+      "뽑아줘", "뽑아 줘", "돌려줘", "돌려 줘", "줘", "좀", "어줘",
+      "please", "pls", "plz", "make it", "make", "create it", "create", "do it", "run it", "run"
+    ].map(s => `(?:${s})`).join("|") + "\\s*$", "i"
+  ),
+  // 조사/어미 꼬리
+  tailJosa: /\s*(을|를|은|는|이|가|에|에서|으로|로|과|와|의|께|에게|한테)\s*$/i,
+  // 중복 스페이스/구두점
+  multiSpace: /\s{2,}/g,
+  trailPunct: /[.,;:!?\u3002\uFF0E\uFF1F\uFF01\uFF0C]+$/g,
+};
+
+function cleanNoise(s = "") {
+  return String(s)
+    .replace(RE.url, " ")
+    .replace(RE.mention, " ")
+    .replace(RE.hashtag, " ")
+    .replace(RE.brackets, " ")
+    .replace(RE.emojis, " ")
+    .replace(RE.multiSpace, " ")
+    .trim();
+}
+
+function extractTitleCandidate(text = "") {
+  // 1) 따옴표 안 우선
+  const quoted = (text.match(RE.quotes) || [])[1];
+  if (quoted) return quoted.trim();
+
+  // 2) 명령어/파라미터/불용어 제거하고 남은 본문에서 추출
+  let t = text
+    .replace(RE.params, " ")
+    .replace(RE.cmdWords, " ")
+    .replace(RE.tailReq, " ")
+    .replace(RE.tailJosa, " ")
+    .replace(RE.trailPunct, "")
+    .replace(RE.multiSpace, " ")
     .trim();
 
-  // 🔧 꼬리 어미(해줘/만들어줘/해봐/돌려줘 …) 제거 패치
+  // 문장 시작부 ‘~은/는’ 제거
+  t = t.replace(/^(은|는|이|가)\s+/i, "").trim();
+  // ‘~만’ 종결 제거
+  t = t.replace(/\s*(만|only)\s*$/i, "").trim();
+
+  return t || undefined;
+}
+
+/* ────────────────────────────────────────────────────────────
+   고급형 자연어 → 명령 파서 (ko/en 혼용)
+──────────────────────────────────────────────────────────── */
+function parseIntentKo(textRaw = "") {
+  const raw = String(textRaw || "").trim();
+  if (!raw) return { intent: "brief", title: undefined, steps: ["brief"], raw };
+
+  // 0) 전처리 (노이즈 제거)
+  const text = cleanNoise(raw);
+
+  // 1) title 후보 추출 + 꼬리 정리
+  let title = extractTitleCandidate(text);
   if (title) {
-    title = title
-      .replace(/\s*(해줘|해주세요|해줘요|해 주세요|해 주라|해줘라|해봐|만들어줘|만들어 줘|만들어주라|만들자|뽑아줘|뽑아 줘|돌려줘|돌려 줘)\s*$/i, "")
-      .replace(/\s{2,}/g, " ")
-      .trim();
+    // 요청형 어미/조사/구두점 추가 정리 (여러 번)
+    for (let i = 0; i < 3; i++) {
+      const before = title;
+      title = title
+        .replace(RE.tailReq, " ")
+        .replace(RE.tailJosa, " ")
+        .replace(RE.trailPunct, "")
+        .replace(RE.multiSpace, " ")
+        .trim();
+      if (before === title) break;
+    }
+    if (title.length < 2) title = undefined;
   }
 
-  if (title && title.length < 2) title = undefined;
+  // 2) intent/steps 판단
+  const wantBrief   = /(브리프|기획안|brief)/i.test(text);
+  const wantScript  = /(스크립트|대본|script)/i.test(text);
+  const wantAssets  = /(썸네일|타이틀|제목|설명|해시태그|메타|assets?)/i.test(text);
+  const wantFull    = /(전체|풀|한번에|원스톱|e2e|end\s*to\s*end)/i.test(text);
 
-  // 단계 의도
-  const wantBrief   = /(브리프|기획안)/.test(text);
-  const wantScript  = /(스크립트|대본)/.test(text);
-  const wantAssets  = /(썸네일|타이틀|제목|설명|해시태그|메타)/.test(text);
-  const wantFull    = /(전체|풀|원스톱|한번에|End[- ]?to[- ]?End|E2E)/i.test(text);
-
-  // profile/notify 파라미터
+  // 3) profile 매핑
   let profile = (text.match(/profile\s*=\s*([^\s]+)/i) || [])[1];
   if (!profile) {
-    if (/튜토리얼|설명형/.test(text)) profile = "shorts_tutorial_v1";
-    else if (/마케팅|프로모션|홍보/.test(text)) profile = "shorts_marketing_v1";
+    if (/(튜토리얼|설명형|how[-\s]?to|tutorial)/i.test(text)) profile = "shorts_tutorial_v1";
+    else if (/(마케팅|프로모션|홍보|광고|promotion|marketing)/i.test(text)) profile = "shorts_marketing_v1";
   }
-  let notify;
-  if (/notify\s*=\s*false/i.test(text) || /(알림\s*끄|조용히|무음)/.test(text)) notify = false;
-  if (/notify\s*=\s*true/i.test(text)  || /(알림\s*켜|통지)/.test(text)) notify = true;
 
-  // steps= 직접 지정
+  // 4) notify 토글
+  let notify;
+  if (/notify\s*=\s*false/i.test(text) || /(알림\s*끄|조용히|무음|silent|quiet)/i.test(text)) notify = false;
+  if (/notify\s*=\s*true/i.test(text)  || /(알림\s*켜|통지|notify)/i.test(text)) notify = true;
+
+  // 5) steps 파라미터 직접 지정 (steps=brief,script)
   let stepsKV = (text.match(/steps\s*=\s*([^\s]+)/i) || [])[1];
   let steps;
   if (stepsKV) {
-    steps = stepsKV.split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
+    steps = stepsKV.split(/[,\s/|>]+/).map(s => s.trim().toLowerCase()).filter(Boolean);
   } else {
     if (wantFull) steps = ["brief", "script", "assets"];
     else {
       const arr = [];
-      if (wantBrief) arr.push("brief");
+      if (wantBrief)  arr.push("brief");
       if (wantScript) arr.push("script");
       if (wantAssets) arr.push("assets");
-      steps = arr.length ? arr : ["brief"]; // 기본: 브리프만
+      steps = arr.length ? arr : ["brief"]; // 기본: 브리프
     }
+    // ‘~만’ 패턴: brief만/스크립트만/썸네일만
+    if (/브리프\s*만|brief\s*only/i.test(text)) steps = ["brief"];
+    if (/스크립트\s*만|대본\s*만|script\s*only/i.test(text)) steps = ["script"];
+    if (/썸네일\s*만|assets?\s*only/i.test(text)) steps = ["assets"];
   }
 
   let intent = "run_parts";
-  if (wantFull || (steps && steps.length === 3)) intent = "run_full";
-  else if (steps.length === 1 && steps[0] === "brief") intent = "brief";
+  if (wantFull || steps.join(",") === "brief,script,assets") intent = "run_full";
+  if (steps.length === 1 && steps[0] === "brief") intent = "brief";
 
-  return { intent, title, steps, profile, notify, raw: text };
+  return { intent, title, steps, profile, notify, raw };
 }
 
 // ========== Telegram Webhook ==========
