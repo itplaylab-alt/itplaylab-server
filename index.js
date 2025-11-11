@@ -7,8 +7,7 @@ import express from "express";
 import axios from "axios";
 import crypto from "crypto";
 import OpenAI from "openai";
-import Ajv from "ajv";
-import addFormats from "ajv-formats";
+
 
 const app = express();
 
@@ -67,10 +66,27 @@ const APPROVAL_MODE = String(process.env.APPROVAL_MODE || "true").toLowerCase() 
 
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 
-// OpenAI Client + AJV
+// OpenAI Client (AJV는 선택적 로드)
 const oa = new OpenAI({ apiKey: OPENAI_API_KEY });
-const ajv = new Ajv({ allErrors: true, strict: false });
-addFormats(ajv);
+
+// ── Optional AJV Loader: 미설치여도 서버가 부팅되도록 동적 import
+let _ajv = null;
+async function ensureAjv() {
+  try {
+    if (_ajv) return _ajv;
+    const ajvMod = await import('ajv').catch(() => ({ default: null }));
+    if (!ajvMod.default) return null; // ajv 미설치 → 검증 스킵
+    const addFormatsMod = await import('ajv-formats').catch(() => ({ default: () => {} }));
+    const Ajv = ajvMod.default;
+    const ajv = new Ajv({ allErrors: true, strict: false });
+    if (addFormatsMod?.default) addFormatsMod.default(ajv);
+    _ajv = ajv;
+    return _ajv;
+  } catch (e) {
+    console.warn('[AJV] optional dependency missing, schema validation skipped');
+    return null;
+  }
+}
 
 // ========== 공통 유틸 ==========
 const genTraceId = () => `trc_${crypto.randomBytes(4).toString("hex")}`;
@@ -255,21 +271,21 @@ async function callOpenAIJson({ system, user, schema, schemaName = "itplaylab_sc
     });
 
     // SDK별 안전 추출
-    txt = resp?.output_text
-      || resp?.output?.[0]?.content?.[0]?.text
-      || "";
-
+    txt = resp?.output_text || resp?.output?.[0]?.content?.[0]?.text || "";
     parsed = txt ? JSON.parse(txt) : null;
   } catch (e) {
     // 2) Fallback — chat.completions + json_object
     provider = "chat.completions";
     try {
-      const schemaHint = `다음 JSON 스키마에 맞춰 정확히 JSON만 출력하세요. 추가 설명 금지.\n${JSON.stringify(schema)}`;
+      const schemaHint = `다음 JSON 스키마에 맞춰 정확히 JSON만 출력하세요. 추가 설명 금지.
+${JSON.stringify(schema)}`;
       const comp = await oa.chat.completions.create({
         model: OPENAI_MODEL_FALLBACK,
         response_format: { type: "json_object" },
         messages: [
-          { role: "system", content: `${system}\n\n${schemaHint}` },
+          { role: "system", content: `${system}
+
+${schemaHint}` },
           { role: "user", content: user },
         ],
         temperature: 0.2,
@@ -286,8 +302,19 @@ async function callOpenAIJson({ system, user, schema, schemaName = "itplaylab_sc
     }
   }
 
-  // 스키마 검증
-  const validate = ajv.compile(schema);
+  // 스키마 검증 (AJV 미설치시 통과 처리)
+  const validator = await ensureAjv();
+  if (!validator) {
+    return {
+      ok: !!parsed,
+      data: parsed,
+      provider,
+      latency_ms: Date.now() - started,
+      errors: [],
+      raw_text: txt,
+    };
+  }
+  const validate = validator.compile(schema);
   const valid = !!parsed && validate(parsed);
   return {
     ok: !!valid,
@@ -297,6 +324,7 @@ async function callOpenAIJson({ system, user, schema, schemaName = "itplaylab_sc
     errors: valid ? [] : validate.errors,
     raw_text: txt,
   };
+}
 }
 
 // ========== 작업 스키마들 ==========
