@@ -1,10 +1,14 @@
 // index.js — ITPlayLab 통합본 (승인 루프 + 한글 알림 + 체크리스트 + GAS 로깅)
-// Node.js 18+, Express, axios, openai
+// ✅ Responses API 우선 사용 + 자동 Fallback(chat.completions) + 스키마 검증(AJV)
+// Node.js 18+, Express, axios, openai, ajv, ajv-formats
+// 설치: npm i express axios openai ajv ajv-formats
 
 import express from "express";
 import axios from "axios";
 import crypto from "crypto";
 import OpenAI from "openai";
+import Ajv from "ajv";
+import addFormats from "ajv-formats";
 
 const app = express();
 
@@ -51,7 +55,11 @@ const GAS_INGEST_URL = process.env.GAS_INGEST_URL;
 const INGEST_TOKEN = process.env.INGEST_TOKEN;
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+// 권장: Responses 모델(gpt-4.1-mini 등)과 Fallback 모델(gpt-4o-mini 등) 분리 설정
+const OPENAI_MODEL_RESP = process.env.OPENAI_MODEL_RESP || "gpt-4.1-mini"; // Responses API용
+const OPENAI_MODEL_FALLBACK = process.env.OPENAI_MODEL_FALLBACK || "gpt-4o-mini"; // chat.completions용
+// 하위호환(이 값만 주는 환경도 동작하도록)
+const OPENAI_MODEL = process.env.OPENAI_MODEL || OPENAI_MODEL_RESP;
 
 const PROJECT = process.env.PROJECT || "itplaylab";
 const SERVICE_NAME = process.env.SERVICE_NAME || "render-bot";
@@ -59,13 +67,16 @@ const APPROVAL_MODE = String(process.env.APPROVAL_MODE || "true").toLowerCase() 
 
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 
-// OpenAI Client
+// OpenAI Client + AJV
 const oa = new OpenAI({ apiKey: OPENAI_API_KEY });
+const ajv = new Ajv({ allErrors: true, strict: false });
+addFormats(ajv);
 
 // ========== 공통 유틸 ==========
 const genTraceId = () => `trc_${crypto.randomBytes(4).toString("hex")}`;
 const nowISO = () => new Date().toISOString();
-const fmtTsKR = (d=new Date()) => d.toLocaleString("ko-KR", { timeZone: "Asia/Seoul", hour12: false });
+const fmtTsKR = (d = new Date()) =>
+  d.toLocaleString("ko-KR", { timeZone: "Asia/Seoul", hour12: false });
 const fmtTrace = (id) => `trace_id: <code>${id}</code>`;
 const fmtTitle = (t) => `제목: <b>${t}</b>`;
 
@@ -75,23 +86,23 @@ const labelStep = (s) => STEP_LABELS[s] || s;
 
 // 승인/반려 체크리스트
 const DEFAULT_CHECKLIST = [
-  { key: "accuracy",  label: "내용 정확성" },
-  { key: "brand",     label: "브랜드 톤/보이스" },
-  { key: "policy",    label: "정책/저작권 준수" },
-  { key: "length",    label: "길이/템포" },
-  { key: "thumbnail", label: "썸네일 적합성" }
+  { key: "accuracy", label: "내용 정확성" },
+  { key: "brand", label: "브랜드 톤/보이스" },
+  { key: "policy", label: "정책/저작권 준수" },
+  { key: "length", label: "길이/템포" },
+  { key: "thumbnail", label: "썸네일 적합성" },
 ];
-const labelOf = key => (DEFAULT_CHECKLIST.find(i => i.key === key)?.label || key);
+const labelOf = (key) => DEFAULT_CHECKLIST.find((i) => i.key === key)?.label || key;
 function parseChecks(text) {
   const m = text.match(/checks\s*=\s*(\[[^\]]+\]|[^\s]+)/i);
   if (!m) return [];
   const raw = m[1].startsWith("[") ? m[1].slice(1, -1) : m[1];
-  return raw.split(",").map(s => s.trim()).filter(Boolean);
+  return raw.split(",").map((s) => s.trim()).filter(Boolean);
 }
 function approverName(from) {
   const p = [];
   if (from?.first_name) p.push(from.first_name);
-  if (from?.last_name)  p.push(from.last_name);
+  if (from?.last_name) p.push(from.last_name);
   return p.join(" ") || from?.username || `user_${from?.id || "unknown"}`;
 }
 
@@ -122,6 +133,7 @@ async function logToSheet(payload) {
         step: payload.step || "",
         ok: typeof payload.ok === "boolean" ? payload.ok : "",
         error: payload.error || "",
+        provider: payload.provider || "",
       }),
     });
     return { ok: true, latency_ms: Date.now() - t0 };
@@ -151,8 +163,8 @@ const shouldNotify = (kind) => NOTIFY_LEVEL.includes(kind);
 function buildNotifyMessage({ type, title, message }) {
   const ts = fmtTsKR();
   if (type === "success") return `✅ <b>${title || "처리 완료"}</b>\n${message || ""}\n\n🕒 ${ts}`;
-  if (type === "error")   return `❌ <b>${title || "오류 발생"}</b>\n${message || ""}\n\n🕒 ${ts}`;
-  if (type === "approval")return `🟡 <b>${title || "승인 요청"}</b>\n${message || ""}\n\n🕒 ${ts}`;
+  if (type === "error") return `❌ <b>${title || "오류 발생"}</b>\n${message || ""}\n\n🕒 ${ts}`;
+  if (type === "approval") return `🟡 <b>${title || "승인 요청"}</b>\n${message || ""}\n\n🕒 ${ts}`;
   return `ℹ️ <b>${title || "알림"}</b>\n${message || ""}\n\n🕒 ${ts}`;
 }
 
@@ -220,126 +232,164 @@ app.get("/test/notify", async (req, res) => {
   }
 });
 
-// ========== OpenAI 작업자 (Responses API + JSON Schema) ==========
-async function aiBrief(idea) {
-  const t0 = Date.now();
-  const response_format = {
-    type: "json_schema",
-    json_schema: {
-      name: "content_brief",
-      strict: true,
-      schema: {
+// ========== OpenAI 공용 호출자 (Responses → Fallback 자동전환) ==========
+async function callOpenAIJson({ system, user, schema, schemaName = "itplaylab_schema" }) {
+  const started = Date.now();
+  let provider = "responses";
+  let txt = "";
+  let parsed = null;
+
+  // 1) Responses API (권장) — 최신 openai SDK 필요
+  try {
+    const resp = await oa.responses.create({
+      model: OPENAI_MODEL || OPENAI_MODEL_RESP,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+      response_format: {
+        type: "json_schema",
+        json_schema: { name: schemaName, strict: true, schema },
+      },
+      temperature: 0.2,
+    });
+
+    // SDK별 안전 추출
+    txt = resp?.output_text
+      || resp?.output?.[0]?.content?.[0]?.text
+      || "";
+
+    parsed = txt ? JSON.parse(txt) : null;
+  } catch (e) {
+    // 2) Fallback — chat.completions + json_object
+    provider = "chat.completions";
+    try {
+      const schemaHint = `다음 JSON 스키마에 맞춰 정확히 JSON만 출력하세요. 추가 설명 금지.\n${JSON.stringify(schema)}`;
+      const comp = await oa.chat.completions.create({
+        model: OPENAI_MODEL_FALLBACK,
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: `${system}\n\n${schemaHint}` },
+          { role: "user", content: user },
+        ],
+        temperature: 0.2,
+      });
+      txt = comp?.choices?.[0]?.message?.content || "";
+      parsed = txt ? JSON.parse(txt) : null;
+    } catch (e2) {
+      return {
+        ok: false,
+        error: `openai_call_failed: ${e2?.message || e?.message}`,
+        provider,
+        latency_ms: Date.now() - started,
+      };
+    }
+  }
+
+  // 스키마 검증
+  const validate = ajv.compile(schema);
+  const valid = !!parsed && validate(parsed);
+  return {
+    ok: !!valid,
+    data: parsed,
+    provider,
+    latency_ms: Date.now() - started,
+    errors: valid ? [] : validate.errors,
+    raw_text: txt,
+  };
+}
+
+// ========== 작업 스키마들 ==========
+const SCHEMA_BRIEF = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    brief_id: { type: "string" },
+    idea_id: { type: "string" },
+    goal: { type: "string" },
+    key_points: { type: "array", items: { type: "string" } },
+    hook: { type: "string" },
+    outline: {
+      type: "array",
+      items: {
         type: "object",
-        additionalProperties: false,
-        properties: {
-          brief_id: { type: "string" },
-          idea_id: { type: "string" },
-          goal: { type: "string" },
-          key_points: { type: "array", items: { type: "string" } },
-          hook: { type: "string" },
-          outline: {
-            type: "array",
-            items: {
-              type: "object",
-              properties: { sec: { type: "number" }, beat: { type: "string" } },
-              required: ["sec", "beat"],
-            },
-          },
-          channels: { type: "array", items: { type: "string" } },
-          due_date: { type: "string" },
-          owner: { type: "string" },
-        },
-        required: ["brief_id", "goal", "outline"],
+        properties: { sec: { type: "number" }, beat: { type: "string" } },
+        required: ["sec", "beat"],
       },
     },
-  };
+    channels: { type: "array", items: { type: "string" } },
+    due_date: { type: "string" },
+    owner: { type: "string" },
+  },
+  required: ["brief_id", "goal", "outline"],
+};
 
-  const messages = [
-    { role: "system", content: "너는 콘텐츠 프로듀서다. 60초 쇼츠 중심으로 간결한 브리프를 작성하라." },
-    { role: "user", content: JSON.stringify(idea) },
-  ];
+const SCHEMA_SCRIPT = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    brief_id: { type: "string" },
+    lang: { type: "string" },
+    shots: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          t_start: { type: "number" },
+          t_end: { type: "number" },
+          narration: { type: "string" },
+          overlay_text: { type: "string" },
+          asset_hint: { type: "string" },
+        },
+        required: ["t_start", "t_end", "narration"],
+      },
+    },
+  },
+  required: ["brief_id", "shots"],
+};
 
-  const resp = await oa.responses.create({ model: OPENAI_MODEL, input: messages, response_format });
-  const raw = resp?.output_text || "";
-  const brief = raw ? JSON.parse(raw) : { fallback: true };
-  return { ok: true, latency_ms: Date.now() - t0, data: brief };
+const SCHEMA_ASSETS = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    brief_id: { type: "string" },
+    thumbnail_prompt: { type: "string" },
+    titles: { type: "array", items: { type: "string" } },
+    descriptions: { type: "array", items: { type: "string" } },
+    hashtags: { type: "array", items: { type: "string" } },
+  },
+  required: ["brief_id", "thumbnail_prompt", "titles"],
+};
+
+// ========== OpenAI 작업자들 (스키마 기반) ==========
+async function aiBrief(idea) {
+  const { data, ok, latency_ms, provider, errors, raw_text, error } = await callOpenAIJson({
+    system: "너는 콘텐츠 프로듀서다. 60초 쇼츠 중심으로 간결한 브리프를 JSON으로만 작성하라.",
+    user: JSON.stringify(idea),
+    schema: SCHEMA_BRIEF,
+    schemaName: "content_brief",
+  });
+  return { ok, latency_ms, data: data || { raw_text }, provider, errors, error };
 }
 
 async function aiScript(brief) {
-  const t0 = Date.now();
-  const response_format = {
-    type: "json_schema",
-    json_schema: {
-      name: "content_script",
-      strict: true,
-      schema: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          brief_id: { type: "string" },
-          lang: { type: "string" },
-          shots: {
-            type: "array",
-            items: {
-              type: "object",
-              properties: {
-                t_start: { type: "number" },
-                t_end: { type: "number" },
-                narration: { type: "string" },
-                overlay_text: { type: "string" },
-                asset_hint: { type: "string" },
-              },
-              required: ["t_start", "t_end", "narration"],
-            },
-          },
-        },
-        required: ["brief_id", "shots"],
-      },
-    },
-  };
-
-  const messages = [
-    { role: "system", content: "너는 숏폼 스크립트라이터다. 총 60초, 샷당 3~6초, 문장은 짧고 명확하게." },
-    { role: "user", content: JSON.stringify(brief) },
-  ];
-
-  const resp = await oa.responses.create({ model: OPENAI_MODEL, input: messages, response_format });
-  const raw = resp?.output_text || "";
-  const script = raw ? JSON.parse(raw) : { fallback: true };
-  return { ok: true, latency_ms: Date.now() - t0, data: script };
+  const { data, ok, latency_ms, provider, errors, raw_text, error } = await callOpenAIJson({
+    system: "너는 숏폼 스크립트라이터다. 총 60초, 샷당 3~6초, 문장은 짧고 명확하게. JSON만 출력.",
+    user: JSON.stringify(brief),
+    schema: SCHEMA_SCRIPT,
+    schemaName: "content_script",
+  });
+  return { ok, latency_ms, data: data || { raw_text }, provider, errors, error };
 }
 
 async function aiAssets({ brief_id, script }) {
-  const t0 = Date.now();
-  const response_format = {
-    type: "json_schema",
-    json_schema: {
-      name: "content_assets",
-      strict: true,
-      schema: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          brief_id: { type: "string" },
-          thumbnail_prompt: { type: "string" },
-          titles: { type: "array", items: { type: "string" } },
-          descriptions: { type: "array", items: { type: "string" } },
-          hashtags: { type: "array", items: { type: "string" } },
-        },
-        required: ["brief_id", "thumbnail_prompt", "titles"],
-      },
-    },
-  };
-
-  const messages = [
-    { role: "system", content: "너는 유튜브 운영자다. 썸네일 프롬프트와 제목/설명을 생성하라. 제목 3안, 해시태그 5개." },
-    { role: "user", content: JSON.stringify({ brief_id, script }) },
-  ];
-
-  const resp = await oa.responses.create({ model: OPENAI_MODEL, input: messages, response_format });
-  const raw = resp?.output_text || "";
-  const assets = raw ? JSON.parse(raw) : { fallback: true };
-  return { ok: true, latency_ms: Date.now() - t0, data: assets };
+  const { data, ok, latency_ms, provider, errors, raw_text, error } = await callOpenAIJson({
+    system: "너는 유튜브 운영자다. 썸네일 프롬프트와 제목/설명을 생성하라. 제목 3안, 해시태그 5개. JSON만 출력.",
+    user: JSON.stringify({ brief_id, script }),
+    schema: SCHEMA_ASSETS,
+    schemaName: "content_assets",
+  });
+  return { ok, latency_ms, data: data || { raw_text }, provider, errors, error };
 }
 
 // ========== 상태 저장소 (in-memory) ==========
@@ -350,7 +400,7 @@ traces.set(traceId, {
   steps: ["brief","script","assets"],
   currentIndex: 0,
   approvalMode: true,
-  history: [ { step, ok, latency_ms, error, startedAt, finishedAt } ],
+  history: [ { step, ok, latency_ms, error, startedAt, finishedAt, provider } ],
   lastOutput: { brief, script, assets },
   status: "initialized"|"running"|"paused"|"rejected"|"completed",
   rejectReason,
@@ -361,6 +411,7 @@ traces.set(traceId, {
 async function executeStep(trace, stepName) {
   const startedAt = nowISO();
   let latency_ms = 0;
+  let provider = "";
   try {
     let r;
     if (stepName === "brief") {
@@ -376,8 +427,14 @@ async function executeStep(trace, stepName) {
       throw new Error(`unknown step: ${stepName}`);
     }
     latency_ms = r.latency_ms;
+    provider = r.provider;
 
-    trace.history.push({ step: stepName, ok: true, latency_ms, startedAt, finishedAt: nowISO() });
+    if (!r.ok) {
+      const reason = r.errors?.[0]?.message || r.error || "schema_validation_failed";
+      throw new Error(reason);
+    }
+
+    trace.history.push({ step: stepName, ok: true, latency_ms, provider, startedAt, finishedAt: nowISO() });
 
     // GAS 로그
     await logToSheet({
@@ -391,6 +448,7 @@ async function executeStep(trace, stepName) {
       trace_id: trace.id,
       step: stepName,
       ok: true,
+      provider,
     });
 
     // 성공 알림
@@ -400,19 +458,19 @@ async function executeStep(trace, stepName) {
         fmtTitle(trace.title),
         fmtTrace(trace.id),
         `단계: <b>${labelStep(stepName)}</b>`,
-        `지연시간: <code>${latency_ms}ms</code>`
+        `지연시간: <code>${latency_ms}ms</code>`,
+        `엔진: <code>${provider}</code>`,
       ].join("\n");
-      await tgSend(trace.chatId, buildNotifyMessage({
-        type: "success",
-        title: stepTitle,
-        message: msg
-      }));
+      await tgSend(
+        trace.chatId,
+        buildNotifyMessage({ type: "success", title: stepTitle, message: msg })
+      );
     }
 
     return { ok: true, latency_ms };
   } catch (e) {
     const error = e?.message || String(e);
-    trace.history.push({ step: stepName, ok: false, latency_ms, error, startedAt, finishedAt: nowISO() });
+    trace.history.push({ step: stepName, ok: false, latency_ms, provider, error, startedAt, finishedAt: nowISO() });
 
     await logToSheet({
       type: `content_${stepName}`,
@@ -426,6 +484,7 @@ async function executeStep(trace, stepName) {
       step: stepName,
       ok: false,
       error,
+      provider,
     });
 
     if (shouldNotify("error")) {
@@ -434,42 +493,35 @@ async function executeStep(trace, stepName) {
         fmtTitle(trace.title),
         fmtTrace(trace.id),
         `단계: <b>${labelStep(stepName)}</b>`,
-        `사유: <code>${error}</code>`
-      ].join("\n");
-      await tgSend(trace.chatId, buildNotifyMessage({
-        type: "error",
-        title: stepTitle,
-        message: msg
-      }));
+        `사유: <code>${error}</code>`,
+        provider ? `엔진: <code>${provider}</code>` : "",
+      ].filter(Boolean).join("\n");
+      await tgSend(
+        trace.chatId,
+        buildNotifyMessage({ type: "error", title: stepTitle, message: msg })
+      );
     }
     throw e;
   }
 }
 
-const getNextStep = (trace) => (trace.currentIndex + 1 < trace.steps.length ? trace.steps[trace.currentIndex + 1] : null);
+const getNextStep = (trace) =>
+  trace.currentIndex + 1 < trace.steps.length ? trace.steps[trace.currentIndex + 1] : null;
 
 async function pauseForApproval(trace) {
   const next = getNextStep(trace);
   if (!next) {
     trace.status = "completed";
     if (shouldNotify("success")) {
-      const msg = [
-        fmtTitle(trace.title),
-        fmtTrace(trace.id),
-        `진행 상태: <b>모든 단계 완료</b>`
-      ].join("\n");
-      await tgSend(trace.chatId, buildNotifyMessage({
-        type: "success",
-        title: "출고 완료",
-        message: msg
-      }));
+      const msg = [fmtTitle(trace.title), fmtTrace(trace.id), `진행 상태: <b>모든 단계 완료</b>`].join("\n");
+      await tgSend(trace.chatId, buildNotifyMessage({ type: "success", title: "출고 완료", message: msg }));
     }
     return;
   }
   trace.status = "paused";
   if (shouldNotify("approval")) {
     const nextK = labelStep(next);
-    const checklistLine = DEFAULT_CHECKLIST.map(i => `- ${i.label} (${i.key})`).join("\n");
+    const checklistLine = DEFAULT_CHECKLIST.map((i) => `- ${i.label} (${i.key})`).join("\n");
     const msg = [
       fmtTitle(trace.title),
       fmtTrace(trace.id),
@@ -483,15 +535,11 @@ async function pauseForApproval(trace) {
       "",
       "반려 예시:",
       `<code>/reject ${trace.id} reason="톤 수정 필요" checks=brand,length</code>`,
-      `상태: <code>/status ${trace.id}</code>`
+      `상태: <code>/status ${trace.id}</code>`,
     ].join("\n");
     await tgSend(
       trace.chatId,
-      buildNotifyMessage({
-        type: "approval",
-        title: `다음 단계 승인 대기`,
-        message: msg
-      })
+      buildNotifyMessage({ type: "approval", title: `다음 단계 승인 대기`, message: msg })
     );
   }
 }
@@ -510,12 +558,11 @@ async function runFromCurrent(trace) {
     } else {
       trace.status = "completed";
       if (shouldNotify("success")) {
-        const msg = [
-          fmtTitle(trace.title),
-          fmtTrace(trace.id),
-          `진행 상태: <b>모든 단계 완료</b>`
-        ].join("\n");
-        await tgSend(trace.chatId, buildNotifyMessage({ type: "success", title: "출고 완료", message: msg }));
+        const msg = [fmtTitle(trace.title), fmtTrace(trace.id), `진행 상태: <b>모든 단계 완료</b>`].join("\n");
+        await tgSend(
+          trace.chatId,
+          buildNotifyMessage({ type: "success", title: "출고 완료", message: msg })
+        );
       }
     }
   }
@@ -526,10 +573,21 @@ function parseFreeText(text) {
   const lower = text.toLowerCase();
   let intent = "run";
   let steps = ["brief", "script", "assets"];
-  if (lower.includes("브리프")) { intent = "brief"; steps = ["brief"]; }
-  if (lower.includes("스크립트")) { intent = "run_parts"; steps = ["script"]; }
-  if (lower.includes("에셋") || lower.includes("메타")) { intent = "run_parts"; steps = ["assets"]; }
-  const title = text.replace(/(브리프|스크립트|에셋|만들어줘|전체|전부|메타|전략)/g, "").trim() || "무제";
+  if (lower.includes("브리프")) {
+    intent = "brief";
+    steps = ["brief"];
+  }
+  if (lower.includes("스크립트")) {
+    intent = "run_parts";
+    steps = ["script"];
+  }
+  if (lower.includes("에셋") || lower.includes("메타")) {
+    intent = "run_parts";
+    steps = ["assets"];
+  }
+  const title = text
+    .replace(/(브리프|스크립트|에셋|만들어줘|전체|전부|메타|전략)/g, "")
+    .trim() || "무제";
   const profileMatch = text.match(/profile=([\w-]+)/i);
   const profile = profileMatch ? profileMatch[1] : "-";
   return { intent, title, steps, profile };
@@ -542,7 +600,7 @@ function parseTelegramCommand(text) {
   const argsText = rest.join(" ");
   const stepMatch = argsText.match(/step=([a-z]+)/i);
   const reasonMatch = argsText.match(/reason=("([^"]+)"|([^\s]+))/i);
-  const reason = reasonMatch ? (reasonMatch[2] || reasonMatch[3]) : undefined;
+  const reason = reasonMatch ? reasonMatch[2] || reasonMatch[3] : undefined;
   const step = stepMatch ? stepMatch[1] : undefined;
   return { cmd, trace_id, step, reason };
 }
@@ -555,8 +613,18 @@ app.post("/content/brief", async (req, res) => {
     const idea = req.body || {};
     if (!idea.title) return res.status(400).json({ ok: false, error: "title required" });
     const r = await aiBrief(idea);
-    await logToSheet({ type: "content_brief", input_text: idea.title, output_text: r.data, project: PROJECT, category: "brief", note: `via /content/brief`, latency_ms: r.latency_ms, ok: true });
-    res.json({ ok: true, latency_ms: Date.now() - t0, brief: r.data });
+    await logToSheet({
+      type: "content_brief",
+      input_text: idea.title,
+      output_text: r.data,
+      project: PROJECT,
+      category: "brief",
+      note: `via /content/brief`,
+      latency_ms: r.latency_ms,
+      ok: r.ok,
+      provider: r.provider,
+    });
+    res.json({ ok: r.ok, latency_ms: Date.now() - t0, brief: r.data });
   } catch (e) {
     console.error("openai brief error:", e?.message || e);
     res.status(500).json({ ok: false, error: "openai_error" });
@@ -569,8 +637,18 @@ app.post("/content/script", async (req, res) => {
   try {
     const brief = req.body || {};
     const r = await aiScript(brief);
-    await logToSheet({ type: "content_script", input_text: brief.brief_id || "", output_text: r.data, project: PROJECT, category: "content", note: `via /content/script`, latency_ms: r.latency_ms, ok: true });
-    res.json({ ok: true, latency_ms: Date.now() - t0, script: r.data });
+    await logToSheet({
+      type: "content_script",
+      input_text: brief.brief_id || "",
+      output_text: r.data,
+      project: PROJECT,
+      category: "content",
+      note: `via /content/script`,
+      latency_ms: r.latency_ms,
+      ok: r.ok,
+      provider: r.provider,
+    });
+    res.json({ ok: r.ok, latency_ms: Date.now() - t0, script: r.data });
   } catch (e) {
     console.error("openai script error:", e?.message || e);
     res.status(500).json({ ok: false, error: "openai_error" });
@@ -583,8 +661,18 @@ app.post("/content/assets", async (req, res) => {
   try {
     const { brief_id, script } = req.body || {};
     const r = await aiAssets({ brief_id, script });
-    await logToSheet({ type: "content_assets", input_text: brief_id || "", output_text: r.data, project: PROJECT, category: "asset", note: `via /content/assets`, latency_ms: r.latency_ms, ok: true });
-    res.json({ ok: true, latency_ms: Date.now() - t0, assets: r.data });
+    await logToSheet({
+      type: "content_assets",
+      input_text: brief_id || "",
+      output_text: r.data,
+      project: PROJECT,
+      category: "asset",
+      note: `via /content/assets`,
+      latency_ms: r.latency_ms,
+      ok: r.ok,
+      provider: r.provider,
+    });
+    res.json({ ok: r.ok, latency_ms: Date.now() - t0, assets: r.data });
   } catch (e) {
     console.error("openai assets error:", e?.message || e);
     res.status(500).json({ ok: false, error: "openai_error" });
@@ -595,11 +683,24 @@ app.post("/content/assets", async (req, res) => {
 app.post("/content/run", async (req, res) => {
   if (!requireOpenAI(res)) return;
   const started = Date.now();
-  const { title, steps = ["brief", "script", "assets"], profile = "-", chatId = TELEGRAM_ADMIN_CHAT_ID } = req.body || {};
+  const { title, steps = ["brief", "script", "assets"], profile = "-", chatId = TELEGRAM_ADMIN_CHAT_ID } =
+    req.body || {};
   if (!title) return res.status(400).json({ ok: false, error: "title required" });
 
   const trace_id = genTraceId();
-  const trace = { id: trace_id, createdAt: nowISO(), chatId, title, profile, steps, currentIndex: 0, approvalMode: APPROVAL_MODE, history: [], lastOutput: {}, status: "initialized" };
+  const trace = {
+    id: trace_id,
+    createdAt: nowISO(),
+    chatId,
+    title,
+    profile,
+    steps,
+    currentIndex: 0,
+    approvalMode: APPROVAL_MODE,
+    history: [],
+    lastOutput: {},
+    status: "initialized",
+  };
   traces.set(trace_id, trace);
 
   try {
@@ -632,7 +733,7 @@ app.post("/approve", async (req, res) => {
     note: `trace=${trace.id}`,
     trace_id,
     step: trace.steps[trace.currentIndex],
-    ok: true
+    ok: true,
   });
 
   try {
@@ -660,7 +761,7 @@ app.post("/reject", async (req, res) => {
     trace_id,
     step: trace.steps[trace.currentIndex],
     ok: false,
-    error: `REJECTED: ${reason}`
+    error: `REJECTED: ${reason}`,
   });
 
   if (shouldNotify("approval")) {
@@ -670,9 +771,12 @@ app.post("/reject", async (req, res) => {
       `진행 상태: <b>반려</b>`,
       `반려자: <b>${by}</b>`,
       `사유: <code>${reason || "-"}</code>`,
-      checks.length ? `체크: ${checks.map(k => labelOf(k)).join(", ")}` : "체크: -"
+      checks.length ? `체크: ${checks.map((k) => labelOf(k)).join(", ")}` : "체크: -",
     ].join("\n");
-    await tgSend(trace.chatId, buildNotifyMessage({ type: "error", title: "반려 처리됨", message: msg }));
+    await tgSend(
+      trace.chatId,
+      buildNotifyMessage({ type: "error", title: "반려 처리됨", message: msg })
+    );
   }
   res.json({ ok: true, trace_id, status: trace.status });
 });
@@ -681,7 +785,16 @@ app.get("/status/:trace_id", async (req, res) => {
   const trace_id = req.params.trace_id;
   const trace = traces.get(trace_id);
   if (!trace) return res.status(404).json({ ok: false, error: "trace not found", trace_id });
-  res.json({ ok: true, latency_ms: 0, trace_id, status: trace.status, current_index: trace.currentIndex, steps: trace.steps, history: trace.history, last_output_keys: Object.keys(trace.lastOutput || {}) });
+  res.json({
+    ok: true,
+    latency_ms: 0,
+    trace_id,
+    status: trace.status,
+    current_index: trace.currentIndex,
+    steps: trace.steps,
+    history: trace.history,
+    last_output_keys: Object.keys(trace.lastOutput || {}),
+  });
 });
 
 // ========== Telegram Webhook ==========
@@ -723,7 +836,7 @@ app.post("/telegram/webhook", async (req, res) => {
         note: `trace=${trace.id}`,
         trace_id: trace.id,
         step: trace.steps[trace.currentIndex],
-        ok: true
+        ok: true,
       });
 
       await runFromCurrent(trace);
@@ -732,14 +845,13 @@ app.post("/telegram/webhook", async (req, res) => {
         fmtTitle(trace.title),
         fmtTrace(trace.id),
         `승인자: <b>${approvedBy}</b>`,
-        checks.length ? `체크: ${checks.map(k => labelOf(k)).join(", ")}` : "체크: -",
-        `상태: <b>${trace.status}</b>`
+        checks.length ? `체크: ${checks.map((k) => labelOf(k)).join(", ")}` : "체크: -",
+        `상태: <b>${trace.status}</b>`,
       ].join("\n");
-      await tgSend(chatId, buildNotifyMessage({
-        type: "success",
-        title: "승인 처리됨",
-        message: msg
-      }));
+      await tgSend(
+        chatId,
+        buildNotifyMessage({ type: "success", title: "승인 처리됨", message: msg })
+      );
       return res.json({ ok: true });
     }
 
@@ -766,7 +878,7 @@ app.post("/telegram/webhook", async (req, res) => {
         trace_id: trace.id,
         step: trace.steps[trace.currentIndex],
         ok: false,
-        error: `REJECTED: ${reason}`
+        error: `REJECTED: ${reason}`,
       });
 
       const msg = [
@@ -775,13 +887,12 @@ app.post("/telegram/webhook", async (req, res) => {
         `진행 상태: <b>반려</b>`,
         `반려자: <b>${rejectedBy}</b>`,
         `사유: <code>${reason || "-"}</code>`,
-        checks.length ? `체크: ${checks.map(k => labelOf(k)).join(", ")}` : "체크: -"
+        checks.length ? `체크: ${checks.map((k) => labelOf(k)).join(", ")}` : "체크: -",
       ].join("\n");
-      await tgSend(chatId, buildNotifyMessage({
-        type: "error",
-        title: "반려 처리됨",
-        message: msg
-      }));
+      await tgSend(
+        chatId,
+        buildNotifyMessage({ type: "error", title: "반려 처리됨", message: msg })
+      );
       return res.json({ ok: true });
     }
 
@@ -792,15 +903,15 @@ app.post("/telegram/webhook", async (req, res) => {
       if (!trace) {
         await tgSend(chatId, `해당 작업을 찾을 수 없습니다.\n${fmtTrace(trace_id)}`);
       } else {
-        const hist = trace.history.map(h =>
-          `${labelStep(h.step)}:${h.ok ? "✅" : "❌"}(${h.latency_ms ?? 0}ms)`
-        ).join(" → ");
+        const hist = trace.history
+          .map((h) => `${labelStep(h.step)}:${h.ok ? "✅" : "❌"}(${h.latency_ms ?? 0}ms/${h.provider || "-"})`)
+          .join(" → ");
         const msg = [
           fmtTitle(trace.title),
           fmtTrace(trace.id),
           `진행 기록: ${hist || "-"}`,
           `현재 위치: index ${trace.currentIndex}/${trace.steps.length}`,
-          `상태: <b>${trace.status}</b>`
+          `상태: <b>${trace.status}</b>`,
         ].join("\n");
         await tgSend(chatId, msg, "HTML");
       }
@@ -812,11 +923,38 @@ app.post("/telegram/webhook", async (req, res) => {
       const { title, steps, profile } = parseFreeText(text);
       const payload = { title, steps, profile, chatId };
       const trace_id = genTraceId();
-      const trace = { id: trace_id, createdAt: nowISO(), chatId, title, profile, steps, currentIndex: 0, approvalMode: APPROVAL_MODE, history: [], lastOutput: {}, status: "initialized" };
+      const trace = {
+        id: trace_id,
+        createdAt: nowISO(),
+        chatId,
+        title,
+        profile,
+        steps,
+        currentIndex: 0,
+        approvalMode: APPROVAL_MODE,
+        history: [],
+        lastOutput: {},
+        status: "initialized",
+      };
       traces.set(trace_id, trace);
-      await tgSend(chatId, buildNotifyMessage({ type: "success", title: "요청 접수", message: `${fmtTrace(trace_id)}` }));
-      try { await runFromCurrent(trace); } catch (e) { /* 실패시 알림은 executeStep에서 처리 */ }
-      await logToSheet({ type: "telegram_text", input_text: text, output_text: payload, project: PROJECT, category: "chat", note: `trace=${trace_id}`, trace_id });
+      await tgSend(
+        chatId,
+        buildNotifyMessage({ type: "success", title: "요청 접수", message: `${fmtTrace(trace_id)}` })
+      );
+      try {
+        await runFromCurrent(trace);
+      } catch (e) {
+        /* 실패시 알림은 executeStep에서 처리 */
+      }
+      await logToSheet({
+        type: "telegram_text",
+        input_text: text,
+        output_text: payload,
+        project: PROJECT,
+        category: "chat",
+        note: `trace=${trace_id}`,
+        trace_id,
+      });
       return res.json({ ok: true });
     }
 
