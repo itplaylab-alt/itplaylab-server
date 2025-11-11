@@ -74,16 +74,22 @@ let _ajv = null;
 async function ensureAjv() {
   try {
     if (_ajv) return _ajv;
-    const ajvMod = await import('ajv').catch(() => ({ default: null }));
-    if (!ajvMod.default) return null; // ajv 미설치 → 검증 스킵
-    const addFormatsMod = await import('ajv-formats').catch(() => ({ default: () => {} }));
+
+    const ajvMod = await import('ajv').catch(() => null);
+    if (!ajvMod?.default) {
+      console.warn("[AJV] not installed → schema validation skipped");
+      return null;
+    }
+
+    const addFormatsMod = await import('ajv-formats').catch(() => null);
     const Ajv = ajvMod.default;
     const ajv = new Ajv({ allErrors: true, strict: false });
     if (addFormatsMod?.default) addFormatsMod.default(ajv);
+
     _ajv = ajv;
     return _ajv;
   } catch (e) {
-    console.warn('[AJV] optional dependency missing, schema validation skipped');
+    console.warn("[AJV] dynamic load failed:", e.message);
     return null;
   }
 }
