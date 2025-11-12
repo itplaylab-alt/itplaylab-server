@@ -420,59 +420,95 @@ app.use((err, req, res, next) => {
 });
 
 // ====== 리포트 자동화 설비 v1 (Markdown 텍스트 중심) ======
-function escapeHtml(s=""){ return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
-function buildReportMarkdown(trace){
-  const success = trace.history.filter(h=>h.ok).length;
-  const fail = trace.history.filter(h=>!h.ok).length;
-  const avg = (()=>{ const v = trace.history.map(h=>h.latency_ms||0).filter(Boolean); return v.length? Math.round(v.reduce((a,b)=>a+b,0)/v.length):0; })();
-  const steps = trace.steps.map((s,idx)=> `${idx<trace.currentIndex?"✔":"•"} ${labelStep(s)}`).join(" → ");
-  const hist = trace.history.map(h=> `- ${labelStep(h.step)}: ${h.ok?"✅":"❌"} (${h.latency_ms||0}ms / ${h.provider||"-"})`).join("
+function escapeHtml(s = "") {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+function buildReportMarkdown(trace) {
+  const success = trace.history.filter((h) => h.ok).length;
+  const fail = trace.history.filter((h) => !h.ok).length;
+  const latVals = trace.history.map((h) => Number(h.latency_ms || 0)).filter((v) => v > 0);
+  const avg = latVals.length ? Math.round(latVals.reduce((a, b) => a + b, 0) / latVals.length) : 0;
+  const steps = trace.steps
+    .map((s, idx) => `${idx < trace.currentIndex ? "✔" : "•"} ${labelStep(s)}`)
+    .join(" → ");
+  const hist = trace.history
+    .map((h) => `- ${labelStep(h.step)}: ${h.ok ? "✅" : "❌"} (${h.latency_ms || 0}ms / ${h.provider || "-"})`)
+    .join("
 ");
-  const out = Object.keys(trace.lastOutput||{}).join(", ") || "-";
-  return `# 🎬 ItplayLab 콘텐츠 자동화 리포트
-**제목:** ${escapeHtml(trace.title)}  
-**Trace ID:** ${trace.id}  
-**상태:** ${trace.status}  
-**리비전:** ${trace.revisionCount}/${MAX_REVISIONS}  
-**생성 시각:** ${trace.createdAt}
+  const out = Object.keys(trace.lastOutput || {}).join(", ") || "-";
+  return (
+    `# 🎬 ItplayLab 콘텐츠 자동화 리포트
+` +
+    `**제목:** ${escapeHtml(trace.title)}  
+` +
+    `**Trace ID:** ${trace.id}  
+` +
+    `**상태:** ${trace.status}  
+` +
+    `**리비전:** ${trace.revisionCount}/${MAX_REVISIONS}  
+` +
+    `**생성 시각:** ${trace.createdAt}
 
----
+` +
+    `---
 
-## 📊 진행 요약
-${steps}
+` +
+    `## 📊 진행 요약
+` +
+    `${steps}
 
-- 성공: ${success} / 실패: ${fail}
-- 평균 지연시간: ${avg}ms
+` +
+    `- 성공: ${success} / 실패: ${fail}
+` +
+    `- 평균 지연시간: ${avg}ms
 
-## 🧱 단계 기록
-${hist}
+` +
+    `## 🧱 단계 기록
+` +
+    `${hist}
 
-## 📦 산출물
-${out}
-`; }
+` +
+    `## 📦 산출물
+` +
+    `${out}
+`
+  );
+}
 
-app.post("/report/generate", async (req,res)=>{
-  const { trace_id } = req.body||{};
-  const trace = traces.get(trace_id);
-  if(!trace) return res.status(404).json({ ok:false, error:"trace not found", trace_id });
-  const md = buildReportMarkdown(trace);
-  await logToSheet({ type:"report_generated", input_text: trace.title, output_text: md, project: PROJECT, category:"report", trace_id, ok:true });
-  res.json({ ok:true, trace_id, report: md });
+app.post("/report/generate", async (req, res) => {
+  try {
+    const { trace_id } = req.body || {};
+    const trace = traces.get(trace_id);
+    if (!trace) return res.status(404).json({ ok: false, error: "trace not found", trace_id });
+    const md = buildReportMarkdown(trace);
+    await logToSheet({ type: "report_generated", input_text: trace.title, output_text: md, project: PROJECT, category: "report", trace_id, ok: true });
+    return res.json({ ok: true, trace_id, report: md });
+  } catch (e) {
+    console.error("/report/generate error", e?.message);
+    return res.status(500).json({ ok: false, error: "report_generate_failed" });
+  }
 });
 
-app.post("/report/send", async (req,res)=>{
-  const { trace_id, chat_id } = req.body||{};
-  const trace = traces.get(trace_id);
-  if(!trace) return res.status(404).json({ ok:false, error:"trace not found", trace_id });
-  const md = buildReportMarkdown(trace);
-  const html = `<pre>${escapeHtml(md)}</pre>`; // Telegram 안전 전송
-  const targetChat = chat_id || trace.chatId || TELEGRAM_ADMIN_CHAT_ID;
-  await withTraceLock(trace, async ()=>{ await tgSend(targetChat, html, "HTML"); });
-  await logToSheet({ type:"report_sent", input_text: trace.title, output_text: { len: md.length }, project: PROJECT, category:"report", trace_id, ok:true });
-  res.json({ ok:true, sent:true, trace_id });
+app.post("/report/send", async (req, res) => {
+  try {
+    const { trace_id, chat_id } = req.body || {};
+    const trace = traces.get(trace_id);
+    if (!trace) return res.status(404).json({ ok: false, error: "trace not found", trace_id });
+    const md = buildReportMarkdown(trace);
+    const html = `<pre>${escapeHtml(md)}</pre>`; // Telegram 안전 전송
+    const targetChat = chat_id || trace.chatId || TELEGRAM_ADMIN_CHAT_ID;
+    await withTraceLock(trace, async () => { await tgSend(targetChat, html, "HTML"); });
+    await logToSheet({ type: "report_sent", input_text: trace.title, output_text: { len: md.length }, project: PROJECT, category: "report", trace_id, ok: true });
+    return res.json({ ok: true, sent: true, trace_id });
+  } catch (e) {
+    console.error("/report/send error", e?.message);
+    return res.status(500).json({ ok: false, error: "report_send_failed" });
+  }
 });
 
-const server = app.listen(process.env.PORT || 10000, () => console.log(`🚀 Server is running on port ${process.env.PORT || 10000} (approval_mode=${String(APPROVAL_MODE)})`));
+const server = app.listen(process.env.PORT || 10000, () =>
+  console.log(`🚀 Server is running on port ${process.env.PORT || 10000} (approval_mode=${String(APPROVAL_MODE)})`)
+);
 
 function gracefulShutdown(signal) {
   console.log(`[SHUTDOWN] ${signal} received — closing server...`);
