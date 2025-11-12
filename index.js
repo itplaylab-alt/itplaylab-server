@@ -7,9 +7,12 @@ import axios from "axios";
 import crypto from "crypto";
 import http from "http";
 import https from "https";
-import helmet from "helmet";
-import compression from "compression";
-import rateLimit from "express-rate-limit";
+// 👉 optional dynamic imports (not fatal if missing)
+let helmet = null, compression = null, rateLimit = null;
+async function _optImport(name){ try{ const m = await import(name); return m?.default || m; } catch { return null; } }
+helmet = await _optImport("helmet");
+compression = await _optImport("compression");
+rateLimit = await _optImport("express-rate-limit");
 import OpenAI from "openai";
 
 const app = express();
@@ -22,11 +25,11 @@ app.use((req, res, next) => {
   req._reqid = req.headers["x-request-id"] || `req_${crypto.randomBytes(6).toString("hex")}`;
   next();
 });
-app.use(helmet({
-  crossOriginResourcePolicy: { policy: "cross-origin" },
-  contentSecurityPolicy: false,
-}));
-app.use(compression());
+const _noopMw = (req,res,next)=>next();
+const helmetMw = helmet ? helmet({ crossOriginResourcePolicy: { policy: "cross-origin" }, contentSecurityPolicy: false }) : _noopMw;
+app.use(helmetMw);
+const compressionMw = compression ? compression() : (req,res,next)=>next();
+app.use(compressionMw);
 
 /* ────────────────────────────────────────────────────────────
    1) 요청 로깅 + Content-Type 확인
@@ -225,7 +228,7 @@ function requireOpenAI(res) {
 /* ────────────────────────────────────────────────────────────
    9) 레이트 리밋 (텔레그램 웹훅 보호)
 ──────────────────────────────────────────────────────────── */
-const webhookLimiter = rateLimit({ windowMs: 10_000, max: 40, standardHeaders: true, legacyHeaders: false });
+const webhookLimiter = rateLimit ? rateLimit({ windowMs: 10_000, max: 40, standardHeaders: true, legacyHeaders: false }) : ((req,res,next)=>next());
 app.use(["/telegram/webhook", "/"], webhookLimiter);
 
 /* ────────────────────────────────────────────────────────────
