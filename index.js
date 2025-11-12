@@ -122,3 +122,69 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`🚀 Server is running on port ${PORT}`);
 });
+// ===============================
+// 📊 KPI DAILY REPORT MODULE
+// ===============================
+import { google } from "googleapis";
+
+async function fetchLogsFromSheet() {
+  // Sheets API 인증 (서비스계정 키 필요)
+  const auth = new google.auth.GoogleAuth({
+    credentials: JSON.parse(process.env.GOOGLE_SERVICE_KEY),
+    scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
+  });
+
+  const sheets = google.sheets({ version: "v4", auth });
+  const sheetId = process.env.GOOGLE_SHEET_ID;
+  const range = "logs!A:F"; // logToSheet() 구조에 맞게 조정
+
+  const res = await sheets.spreadsheets.values.get({ spreadsheetId: sheetId, range });
+  const rows = res.data.values || [];
+  return rows.slice(1).map((r) => ({
+    time: r[0],
+    type: r[1],
+    ok: r[2] === "true",
+    latency_ms: Number(r[3] || 0),
+    project: r[4],
+  }));
+}
+
+function analyzeLogs(rows) {
+  const okCount = rows.filter((r) => r.ok).length;
+  const failCount = rows.length - okCount;
+  const latency = rows.map((r) => r.latency_ms).filter((v) => v > 0);
+  const avgLatency = latency.length
+    ? Math.round(latency.reduce((a, b) => a + b, 0) / latency.length)
+    : 0;
+  const jsonErrorCount = rows.filter((r) => r.type.includes("json_error")).length;
+
+  return {
+    total: rows.length,
+    ok: okCount,
+    fail: failCount,
+    successRate: rows.length ? Math.round((okCount / rows.length) * 100) : 0,
+    avgLatency,
+    jsonErrorRate: rows.length ? Math.round((jsonErrorCount / rows.length) * 100) : 0,
+  };
+}
+
+app.get("/kpi/daily", async (req, res) => {
+  try {
+    const logs = await fetchLogsFromSheet();
+    const kpi = analyzeLogs(logs);
+    const md = `
+# 📊 ItplayLab Daily KPI
+
+- 총 처리 건수: ${kpi.total}
+- 성공률: ${kpi.successRate}%
+- 평균 latency: ${kpi.avgLatency}ms
+- JSON 오류율: ${kpi.jsonErrorRate}%
+- 실패: ${kpi.fail}건
+`;
+
+    res.json({ ok: true, kpi, markdown: md });
+  } catch (err) {
+    console.error("/kpi/daily error", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
