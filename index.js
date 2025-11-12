@@ -1,6 +1,6 @@
-// ====== REPORT AUTOMATION MODULE v1 ======
+// ✅ REPORT MODULE (복붙 그대로 사용)
 
-// 리포트 유틸
+// --- 유틸 함수 ---
 function escapeHtml(s = "") {
   return String(s)
     .replace(/&/g, "&amp;")
@@ -11,26 +11,12 @@ function escapeHtml(s = "") {
 function buildReportMarkdown(trace) {
   const success = trace.history.filter((h) => h.ok).length;
   const fail = trace.history.filter((h) => !h.ok).length;
-  const vals = trace.history
-    .map((h) => Number(h.latency_ms || 0))
-    .filter((v) => v > 0);
-  const avg = vals.length
-    ? Math.round(vals.reduce((a, b) => a + b, 0) / vals.length)
-    : 0;
-
-  const stepsLine = trace.steps
-    .map((s, i) => `${i < trace.currentIndex ? "✔" : "•"} ${labelStep(s)}`)
-    .join(" → ");
-
+  const vals = trace.history.map((h) => Number(h.latency_ms || 0)).filter((v) => v > 0);
+  const avg = vals.length ? Math.round(vals.reduce((a, b) => a + b, 0) / vals.length) : 0;
+  const steps = trace.steps.map((s, i) => `${i < trace.currentIndex ? "✔" : "•"} ${labelStep(s)}`).join(" → ");
   const hist = trace.history
-    .map(
-      (h) =>
-        `- ${labelStep(h.step)}: ${h.ok ? "✅" : "❌"} (${
-          h.latency_ms || 0
-        }ms / ${h.provider || "-"})`
-    )
+    .map((h) => `- ${labelStep(h.step)}: ${h.ok ? "✅" : "❌"} (${h.latency_ms || 0}ms / ${h.provider || "-"})`)
     .join("\n");
-
   const out = Object.keys(trace.lastOutput || {}).join(", ") || "-";
 
   let md = "# 🎬 ItplayLab 콘텐츠 자동화 리포트\n";
@@ -39,26 +25,22 @@ function buildReportMarkdown(trace) {
   md += `**상태:** ${trace.status}  \n`;
   md += `**리비전:** ${trace.revisionCount}/${MAX_REVISIONS}  \n`;
   md += `**생성 시각:** ${trace.createdAt}\n\n`;
-  md += `---\n\n## 📊 진행 요약\n${stepsLine}\n\n`;
+  md += `---\n\n## 📊 진행 요약\n${steps}\n\n`;
   md += `- 성공: ${success} / 실패: ${fail}\n`;
   md += `- 평균 지연시간: ${avg}ms\n\n`;
   md += `## 🧱 단계 기록\n${hist}\n\n`;
   md += `## 📦 산출물\n${out}\n`;
-
   return md;
 }
 
-// 리포트 라우트 등록
-function registerReportRoutes() {
+// --- 라우트 등록 함수 ---
+function registerReportRoutes(app) {
   // /report/generate
   app.post("/report/generate", async (req, res) => {
     try {
       const trace_id = req.body?.trace_id || "";
       const trace = traces.get(trace_id);
-      if (!trace) {
-        res.status(404).json({ ok: false, error: "trace not found", trace_id });
-        return;
-      }
+      if (!trace) return res.status(404).json({ ok: false, error: "trace not found", trace_id });
 
       const md = buildReportMarkdown(trace);
       await logToSheet({
@@ -74,9 +56,7 @@ function registerReportRoutes() {
       res.json({ ok: true, trace_id, report: md });
     } catch (e) {
       console.error("/report/generate error", e?.message || e);
-      res
-        .status(500)
-        .json({ ok: false, error: "report_generate_failed", message: e?.message });
+      res.status(500).json({ ok: false, error: "report_generate_failed" });
     }
   });
 
@@ -86,10 +66,7 @@ function registerReportRoutes() {
       const trace_id = req.body?.trace_id || "";
       const chat_id = req.body?.chat_id;
       const trace = traces.get(trace_id);
-      if (!trace) {
-        res.status(404).json({ ok: false, error: "trace not found", trace_id });
-        return;
-      }
+      if (!trace) return res.status(404).json({ ok: false, error: "trace not found", trace_id });
 
       const md = buildReportMarkdown(trace);
       const html = "<pre>" + escapeHtml(md) + "</pre>";
@@ -112,14 +89,10 @@ function registerReportRoutes() {
       res.json({ ok: true, sent: true, trace_id });
     } catch (e) {
       console.error("/report/send error", e?.message || e);
-      res
-        .status(500)
-        .json({ ok: false, error: "report_send_failed", message: e?.message });
+      res.status(500).json({ ok: false, error: "report_send_failed" });
     }
   });
 }
 
-// 라우트 등록 실행 (app 정의 이후 호출)
-registerReportRoutes();
-
-// ====== END REPORT MODULE ======
+// --- 실행 (app 선언 이후에 호출해야 함!) ---
+registerReportRoutes(app);
