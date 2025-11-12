@@ -1,8 +1,8 @@
-// ======================================================
-// 📦 REPORT AUTOMATION MODULE (SAFE VERSION)
-// ======================================================
+// ================================
+// 📦 REPORT AUTOMATION MODULE FINAL
+// ================================
 
-// --- 유틸 ---
+// --- 유틸 함수 ---
 function escapeHtml(s = "") {
   return String(s)
     .replace(/&/g, "&amp;")
@@ -20,8 +20,12 @@ function buildReportMarkdown(trace) {
     .join(" → ");
 
   const hist = trace.history
-    .map((h) => `- ${labelStep(h.step)}: ${h.ok ? "✅" : "❌"} (${h.latency_ms || 0}ms / ${h.provider || "-"})`)
+    .map(
+      (h) =>
+        `- ${labelStep(h.step)}: ${h.ok ? "✅" : "❌"} (${h.latency_ms || 0}ms / ${h.provider || "-"})`
+    )
     .join("\n");
+
   const out = Object.keys(trace.lastOutput || {}).join(", ") || "-";
 
   let md = "# 🎬 ItplayLab 콘텐츠 자동화 리포트\n";
@@ -35,12 +39,11 @@ function buildReportMarkdown(trace) {
   md += `- 평균 지연시간: ${avg}ms\n\n`;
   md += `## 🧱 단계 기록\n${hist}\n\n`;
   md += `## 📦 산출물\n${out}\n`;
-
   return md;
 }
 
-// --- 등록 함수 ---
-export function setupReportRoutes(app) {
+// --- 라우트 추가 함수 ---
+function setupReportRoutes(app) {
   // /report/generate
   app.post("/report/generate", async (req, res) => {
     try {
@@ -62,7 +65,7 @@ export function setupReportRoutes(app) {
 
       res.json({ ok: true, trace_id, report: md });
     } catch (e) {
-      console.error("/report/generate error:", e?.message);
+      console.error("/report/generate error", e?.message);
       res.status(500).json({ ok: false, error: "report_generate_failed" });
     }
   });
@@ -80,7 +83,9 @@ export function setupReportRoutes(app) {
       const html = "<pre>" + escapeHtml(md) + "</pre>";
       const targetChat = chat_id || trace.chatId || TELEGRAM_ADMIN_CHAT_ID;
 
-      await tgSend(targetChat, html, "HTML");
+      await withTraceLock(trace, async () => {
+        await tgSend(targetChat, html, "HTML");
+      });
 
       await logToSheet({
         type: "report_sent",
@@ -94,20 +99,26 @@ export function setupReportRoutes(app) {
 
       res.json({ ok: true, sent: true, trace_id });
     } catch (e) {
-      console.error("/report/send error:", e?.message);
+      console.error("/report/send error", e?.message);
       res.status(500).json({ ok: false, error: "report_send_failed" });
     }
   });
 }
 
-// ======================================================
-// ✅ app 생성 이후에 호출
-// ======================================================
+// ================================
+// ✅ Express app 생성 및 서버 구동
+// ================================
+import express from "express";
+const app = express();
 
-// 아래 두 줄이 반드시 이 순서여야 함!
+// 미들웨어 등 다른 설정이 있다면 여기에 추가
+app.use(express.json());
+
+// 리포트 라우트 등록 (app 선언 이후)
 setupReportRoutes(app);
 
+// 서버 시작
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () =>
-  console.log(`🚀 Server is running on port ${PORT} (approval_mode=${APPROVAL_MODE})`)
-);
+app.listen(PORT, () => {
+  console.log(`🚀 Server is running on port ${PORT}`);
+});
