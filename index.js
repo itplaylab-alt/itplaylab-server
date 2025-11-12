@@ -1,20 +1,34 @@
-// ====== REPORT: start ======
+// ====== REPORT AUTOMATION MODULE v1 ======
+
+// 리포트 유틸
 function escapeHtml(s = "") {
-  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
 function buildReportMarkdown(trace) {
   const success = trace.history.filter((h) => h.ok).length;
   const fail = trace.history.filter((h) => !h.ok).length;
-  const vals = trace.history.map((h) => Number(h.latency_ms || 0)).filter((v) => v > 0);
-  const avg = vals.length ? Math.round(vals.reduce((a, b) => a + b, 0) / vals.length) : 0;
+  const vals = trace.history
+    .map((h) => Number(h.latency_ms || 0))
+    .filter((v) => v > 0);
+  const avg = vals.length
+    ? Math.round(vals.reduce((a, b) => a + b, 0) / vals.length)
+    : 0;
 
   const stepsLine = trace.steps
     .map((s, i) => `${i < trace.currentIndex ? "✔" : "•"} ${labelStep(s)}`)
     .join(" → ");
 
   const hist = trace.history
-    .map((h) => `- ${labelStep(h.step)}: ${h.ok ? "✅" : "❌"} (${h.latency_ms || 0}ms / ${h.provider || "-"})`)
+    .map(
+      (h) =>
+        `- ${labelStep(h.step)}: ${h.ok ? "✅" : "❌"} (${
+          h.latency_ms || 0
+        }ms / ${h.provider || "-"})`
+    )
     .join("\n");
 
   const out = Object.keys(trace.lastOutput || {}).join(", ") || "-";
@@ -30,65 +44,82 @@ function buildReportMarkdown(trace) {
   md += `- 평균 지연시간: ${avg}ms\n\n`;
   md += `## 🧱 단계 기록\n${hist}\n\n`;
   md += `## 📦 산출물\n${out}\n`;
+
   return md;
 }
 
-app.post("/report/generate", async (req, res) => {
-  try {
-    const trace_id = req.body?.trace_id || "";
-    const trace = traces.get(trace_id);
-    if (!trace) {
-      res.status(404).json({ ok: false, error: "trace not found", trace_id });
-      return;
+// 리포트 라우트 등록
+function registerReportRoutes() {
+  // /report/generate
+  app.post("/report/generate", async (req, res) => {
+    try {
+      const trace_id = req.body?.trace_id || "";
+      const trace = traces.get(trace_id);
+      if (!trace) {
+        res.status(404).json({ ok: false, error: "trace not found", trace_id });
+        return;
+      }
+
+      const md = buildReportMarkdown(trace);
+      await logToSheet({
+        type: "report_generated",
+        input_text: trace.title,
+        output_text: md,
+        project: PROJECT,
+        category: "report",
+        trace_id,
+        ok: true,
+      });
+
+      res.json({ ok: true, trace_id, report: md });
+    } catch (e) {
+      console.error("/report/generate error", e?.message || e);
+      res
+        .status(500)
+        .json({ ok: false, error: "report_generate_failed", message: e?.message });
     }
-    const md = buildReportMarkdown(trace);
-    await logToSheet({
-      type: "report_generated",
-      input_text: trace.title,
-      output_text: md,
-      project: PROJECT,
-      category: "report",
-      trace_id,
-      ok: true,
-    });
-    res.json({ ok: true, trace_id, report: md });
-  } catch (e) {
-    console.error("/report/generate error", e?.message || e);
-    res.status(500).json({ ok: false, error: "report_generate_failed" });
-  }
-});
+  });
 
-app.post("/report/send", async (req, res) => {
-  try {
-    const trace_id = req.body?.trace_id || "";
-    const chat_id = req.body?.chat_id;
-    const trace = traces.get(trace_id);
-    if (!trace) {
-      res.status(404).json({ ok: false, error: "trace not found", trace_id });
-      return;
+  // /report/send
+  app.post("/report/send", async (req, res) => {
+    try {
+      const trace_id = req.body?.trace_id || "";
+      const chat_id = req.body?.chat_id;
+      const trace = traces.get(trace_id);
+      if (!trace) {
+        res.status(404).json({ ok: false, error: "trace not found", trace_id });
+        return;
+      }
+
+      const md = buildReportMarkdown(trace);
+      const html = "<pre>" + escapeHtml(md) + "</pre>";
+      const targetChat = chat_id || trace.chatId || TELEGRAM_ADMIN_CHAT_ID;
+
+      await withTraceLock(trace, async () => {
+        await tgSend(targetChat, html, "HTML");
+      });
+
+      await logToSheet({
+        type: "report_sent",
+        input_text: trace.title,
+        output_text: { len: md.length },
+        project: PROJECT,
+        category: "report",
+        trace_id,
+        ok: true,
+      });
+
+      res.json({ ok: true, sent: true, trace_id });
+    } catch (e) {
+      console.error("/report/send error", e?.message || e);
+      res
+        .status(500)
+        .json({ ok: false, error: "report_send_failed", message: e?.message });
     }
-    const md = buildReportMarkdown(trace);
-    const html = "<pre>" + escapeHtml(md) + "</pre>";
-    const targetChat = chat_id || trace.chatId || TELEGRAM_ADMIN_CHAT_ID;
+  });
+}
 
-    await withTraceLock(trace, async () => {
-      await tgSend(targetChat, html, "HTML");
-    });
+// 라우트 등록 실행 (app 정의 이후 호출)
+registerReportRoutes();
 
-    await logToSheet({
-      type: "report_sent",
-      input_text: trace.title,
-      output_text: { len: md.length },
-      project: PROJECT,
-      category: "report",
-      trace_id,
-      ok: true,
-    });
-
-    res.json({ ok: true, sent: true, trace_id });
-  } catch (e) {
-    console.error("/report/send error", e?.message || e);
-    res.status(500).json({ ok: false, error: "report_send_failed" });
-  }
-});
-// ====== REPORT: end ======
+// ====== END REPORT MODULE ======
