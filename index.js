@@ -782,4 +782,34 @@ app.post("/", async (req, res) => {
    START
 ──────────────────────────────────────────────────────────── */
 const PORT = process.env.PORT || 10000;
+/* ________________________________________________
+   START
+___________________________________________________ */
+
+// Google Apps Script 연결 테스트
+app.get('/test-gas', async (req, res) => {
+  try {
+    const resp = await fetch(process.env.GAS_INGEST_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        token: process.env.INGEST_TOKEN,
+        contents: {
+          type: 'test_log',
+          message: 'hello_from_render_test'
+        }
+      })
+    });
+
+    const text = await resp.text();
+    return res.send(`GAS Response: ${text}`);
+  } catch (e) {
+    console.error('GAS ERROR:', e);
+    return res.status(500).send('GAS ERROR');
+  }
+});
+
+const PORT = process.env.PORT || 10000;
+);
+
 app.listen(PORT, () => console.log(`🚀 Server is running on port ${PORT} (approval_mode=${APPROVAL_MODE})`));
