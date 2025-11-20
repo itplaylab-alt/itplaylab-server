@@ -6,6 +6,7 @@ import axios from "axios";
 import crypto from "crypto";
 import OpenAI from "openai";
 import { callLiteGPT } from "./liteClient.js";
+
 const app = express();
 
 /* ────────────────────────────────────────────────────────────
@@ -23,13 +24,11 @@ app.use(express.json({ limit: "1mb", type: ["application/json"] }));
 app.use((err, req, res, next) => {
   if (err?.type === "entity.parse.failed" || err instanceof SyntaxError) {
     console.error("❌ JSON parse error:", err.message);
-    return res
-      .status(400)
-      .json({
-        ok: false,
-        error: "invalid_json",
-        detail: err.message,
-      });
+    return res.status(400).json({
+      ok: false,
+      error: "invalid_json",
+      detail: err.message,
+    });
   }
   next();
 });
@@ -136,9 +135,7 @@ function buildNotifyMessage({ type, title, message }) {
 
 function requireOpenAI(res) {
   if (!OPENAI_API_KEY) {
-    res
-      .status(500)
-      .json({ ok: false, error: "OPENAI_API_KEY missing" });
+    res.status(500).json({ ok: false, error: "OPENAI_API_KEY missing" });
     return false;
   }
   return true;
@@ -147,8 +144,7 @@ function requireOpenAI(res) {
 /* GAS 로깅 */
 async function logToSheet(payload) {
   const t0 = Date.now();
-  if (!GAS_INGEST_URL || !INGEST_TOKEN)
-    return { ok: false, skipped: true };
+  if (!GAS_INGEST_URL || !INGEST_TOKEN) return { ok: false, skipped: true };
   try {
     await axios.post(GAS_INGEST_URL, {
       token: INGEST_TOKEN,
@@ -207,34 +203,36 @@ async function tgSend(chatId, text, parse_mode = "HTML", extra = {}) {
 }
 async function tgAnswerCallback(id, text = "", show_alert = false) {
   try {
-    return await axios.post(
-      `${TELEGRAM_API}/answerCallbackQuery`,
-      {
-        callback_query_id: id,
-        text,
-        show_alert,
-      }
-    );
+    return await axios.post(`${TELEGRAM_API}/answerCallbackQuery`, {
+      callback_query_id: id,
+      text,
+      show_alert,
+    });
   } catch (e) {
-    console.error(
-      "Telegram answerCallbackQuery error:",
-      e?.message
-    );
+    console.error("Telegram answerCallbackQuery error:", e?.message);
   }
 }
 
 /* ────────────────────────────────────────────────────────────
    3) 테스트 라우트
 ──────────────────────────────────────────────────────────── */
-app.get("/test/healthcheck", (req, res) =>
+
+// 가장 단순한 핑 라우트 (Express/포트 살아있는지 확인용)
+app.get("/__ping", (req, res) => {
+  console.log("[HEALTH] __ping called");
+  res.send("OK");
+});
+
+app.get("/test/healthcheck", (req, res) => {
+  console.log("[HEALTH] /test/healthcheck hit");
   res.json({
     ok: true,
     service: "Render → GAS Bridge + Notify + Approval Loop",
     status: "Render is alive ✅",
     timestamp: new Date().toISOString(),
     approval_mode: APPROVAL_MODE,
-  })
-);
+  });
+});
 
 app.get("/test/send-log", async (req, res) => {
   try {
@@ -247,9 +245,7 @@ app.get("/test/send-log", async (req, res) => {
     });
     res.json({ ok: true, sent_to_gas: !!r.ok });
   } catch (e) {
-    res
-      .status(500)
-      .json({ ok: false, error: e?.message });
+    res.status(500).json({ ok: false, error: e?.message });
   }
 });
 
@@ -257,9 +253,7 @@ app.get("/test/notify", async (req, res) => {
   try {
     const type = String(req.query.type || "success").toLowerCase();
     const title = String(req.query.title || "Ping");
-    const message = String(
-      req.query.message || "Render Notify Test"
-    );
+    const message = String(req.query.message || "Render Notify Test");
     if (!shouldNotify(type))
       return res.json({
         ok: true,
@@ -278,9 +272,7 @@ app.get("/test/notify", async (req, res) => {
     });
     res.json({ ok: true, sent: true, type });
   } catch (e) {
-    res
-      .status(500)
-      .json({ ok: false, error: e?.message });
+    res.status(500).json({ ok: false, error: e?.message });
   }
 });
 
@@ -313,9 +305,7 @@ function groupActive(limitPerBucket = 20) {
   }
   for (const k of Object.keys(buckets)) {
     buckets[k]
-      .sort((a, b) =>
-        (a.createdAt || "").localeCompare(b.createdAt)
-      )
+      .sort((a, b) => (a.createdAt || "").localeCompare(b.createdAt))
       .reverse();
     buckets[k] = buckets[k].slice(0, limitPerBucket);
   }
@@ -326,10 +316,7 @@ function groupActive(limitPerBucket = 20) {
   return { total, counts, buckets };
 }
 app.get("/dashboard/active", (req, res) => {
-  const limit = Math.max(
-    1,
-    Math.min(100, Number(req.query.limit || 20))
-  );
+  const limit = Math.max(1, Math.min(100, Number(req.query.limit || 20)));
   res.json({ ok: true, ...groupActive(limit) });
 });
 
@@ -360,10 +347,7 @@ async function callOpenAIJson({
       },
       temperature: 0.2,
     });
-    txt =
-      resp?.output_text ||
-      resp?.output?.[0]?.content?.[0]?.text ||
-      "";
+    txt = resp?.output_text || resp?.output?.[0]?.content?.[0]?.text || "";
     parsed = txt ? JSON.parse(txt) : null;
   } catch (e) {
     provider = "chat.completions";
@@ -375,10 +359,7 @@ async function callOpenAIJson({
         model: OPENAI_MODEL_FALLBACK,
         response_format: { type: "json_object" },
         messages: [
-          {
-            role: "system",
-            content: `${system}\n\n${schemaHint}`,
-          },
+          { role: "system", content: `${system}\n\n${schemaHint}` },
           { role: "user", content: user },
         ],
         temperature: 0.2,
@@ -388,9 +369,7 @@ async function callOpenAIJson({
     } catch (e2) {
       return {
         ok: false,
-        error: `openai_call_failed: ${
-          e2?.message || e?.message
-        }`,
+        error: `openai_call_failed: ${e2?.message || e?.message}`,
         provider,
         latency_ms: Date.now() - started,
       };
@@ -513,8 +492,6 @@ async function aiAssets({ brief_id, script }) {
 
 /* ────────────────────────────────────────────────────────────
    4-1) LITE AI 작업자 (패턴 기반, gpt-4o-mini + LITE_SYSTEM_PROMPT)
-   - 기존 aiBrief/aiScript/aiAssets는 그대로 유지
-   - 여기서는 callLiteGPT 래핑만 수행
 ──────────────────────────────────────────────────────────── */
 async function aiBriefLite(idea, meta = {}) {
   const r = await callLiteGPT("brief", idea, {
@@ -524,7 +501,7 @@ async function aiBriefLite(idea, meta = {}) {
 
   return {
     ok: r.ok,
-    data: r.output, // LITE 브리프 결과(문자열 또는 JSON)
+    data: r.output,
     provider: r.debug?.engine || "gpt-4o-mini-lite",
     latency_ms: r.debug?.latency_ms ?? 0,
     raw: r,
@@ -539,7 +516,7 @@ async function aiScriptLite(brief, meta = {}) {
 
   return {
     ok: r.ok,
-    data: r.output, // LITE 스크립트 결과(문자열 또는 JSON)
+    data: r.output,
     provider: r.debug?.engine || "gpt-4o-mini-lite",
     latency_ms: r.debug?.latency_ms ?? 0,
     raw: r,
@@ -577,9 +554,7 @@ async function executeStep(trace, stepName) {
     provider = r.provider;
     if (!r.ok)
       throw new Error(
-        r.errors?.[0]?.message ||
-          r.error ||
-          "schema_validation_failed"
+        r.errors?.[0]?.message || r.error || "schema_validation_failed"
       );
 
     trace.history.push({
@@ -790,8 +765,7 @@ function parseFreeText(text) {
   let steps = ["brief", "script", "assets"];
   if (lower.includes("브리프")) steps = ["brief"];
   if (lower.includes("스크립트")) steps = ["script"];
-  if (lower.includes("에셋") || lower.includes("메타"))
-    steps = ["assets"];
+  if (lower.includes("에셋") || lower.includes("메타")) steps = ["assets"];
   const title =
     text
       .replace(
@@ -809,12 +783,8 @@ function parseTelegramCommand(text) {
     idOrText && idOrText.startsWith("trc_") ? idOrText : undefined;
   const argsText = rest.join(" ");
   const stepMatch = argsText.match(/step=([a-z]+)/i);
-  const reasonMatch = argsText.match(
-    /reason=("([^"]+)"|([^\s]+))/i
-  );
-  const reason = reasonMatch
-    ? reasonMatch[2] || reasonMatch[3]
-    : undefined;
+  const reasonMatch = argsText.match(/reason=("([^"]+)"|([^\s]+))/i);
+  const reason = reasonMatch ? reasonMatch[2] || reasonMatch[3] : undefined;
   const step = stepMatch ? stepMatch[1] : undefined;
   return { cmd, trace_id, step, reason };
 }
@@ -823,19 +793,14 @@ function parseTelegramCommand(text) {
    7) REST: 콘텐츠 라인
 ──────────────────────────────────────────────────────────── */
 
-/* LITE 전용 라인: /content/lite/brief, /content/lite/script
-   - 기존 /content/brief, /content/script 는 DEEP 모드 그대로 유지
-   - payload 형식은 기존과 동일하게 사용 가능 (idea.title / brief 등)
-*/
+/* LITE 전용 라인 */
 app.post("/content/lite/brief", async (req, res) => {
   if (!requireOpenAI(res)) return;
   const t0 = Date.now();
   try {
     const idea = req.body || {};
     if (!idea.title)
-      return res
-        .status(400)
-        .json({ ok: false, error: "title required" });
+      return res.status(400).json({ ok: false, error: "title required" });
 
     const r = await aiBriefLite(idea);
 
@@ -854,16 +819,14 @@ app.post("/content/lite/brief", async (req, res) => {
     res.json({
       ok: r.ok,
       latency_ms: Date.now() - t0,
-      brief: r.data, // LITE 브리프 결과
+      brief: r.data,
       debug: {
         provider: r.provider,
         latency_ms: r.latency_ms,
       },
     });
   } catch (e) {
-    res
-      .status(500)
-      .json({ ok: false, error: "lite_openai_error" });
+    res.status(500).json({ ok: false, error: "lite_openai_error" });
   }
 });
 
@@ -889,29 +852,25 @@ app.post("/content/lite/script", async (req, res) => {
     res.json({
       ok: r.ok,
       latency_ms: Date.now() - t0,
-      script: r.data, // LITE 스크립트 결과
+      script: r.data,
       debug: {
         provider: r.provider,
         latency_ms: r.latency_ms,
       },
     });
   } catch (e) {
-    res
-      .status(500)
-      .json({ ok: false, error: "lite_openai_error" });
+    res.status(500).json({ ok: false, error: "lite_openai_error" });
   }
 });
 
-/* 기존 DEEP 모드 라인 (그대로 유지) */
+/* 기존 DEEP 모드 라인 */
 app.post("/content/brief", async (req, res) => {
   if (!requireOpenAI(res)) return;
   const t0 = Date.now();
   try {
     const idea = req.body || {};
     if (!idea.title)
-      return res
-        .status(400)
-        .json({ ok: false, error: "title required" });
+      return res.status(400).json({ ok: false, error: "title required" });
     const r = await aiBrief(idea);
     await logToSheet({
       type: "content_brief",
@@ -930,9 +889,7 @@ app.post("/content/brief", async (req, res) => {
       brief: r.data,
     });
   } catch (e) {
-    res
-      .status(500)
-      .json({ ok: false, error: "openai_error" });
+    res.status(500).json({ ok: false, error: "openai_error" });
   }
 });
 app.post("/content/script", async (req, res) => {
@@ -958,9 +915,7 @@ app.post("/content/script", async (req, res) => {
       script: r.data,
     });
   } catch (e) {
-    res
-      .status(500)
-      .json({ ok: false, error: "openai_error" });
+    res.status(500).json({ ok: false, error: "openai_error" });
   }
 });
 app.post("/content/assets", async (req, res) => {
@@ -986,9 +941,7 @@ app.post("/content/assets", async (req, res) => {
       assets: r.data,
     });
   } catch (e) {
-    res
-      .status(500)
-      .json({ ok: false, error: "openai_error" });
+    res.status(500).json({ ok: false, error: "openai_error" });
   }
 });
 app.post("/content/run", async (req, res) => {
@@ -1001,9 +954,7 @@ app.post("/content/run", async (req, res) => {
     chatId = TELEGRAM_ADMIN_CHAT_ID,
   } = req.body || {};
   if (!title)
-    return res
-      .status(400)
-      .json({ ok: false, error: "title required" });
+    return res.status(400).json({ ok: false, error: "title required" });
 
   const trace_id = genTraceId();
   const trace = {
@@ -1044,12 +995,7 @@ app.post("/content/run", async (req, res) => {
 
 /* 승인/반려/상태/리포트 */
 app.post("/approve", async (req, res) => {
-  const {
-    trace_id,
-    step,
-    checks = [],
-    by = "api",
-  } = req.body || {};
+  const { trace_id, step, checks = [], by = "api" } = req.body || {};
   const trace = traces.get(trace_id);
   if (!trace)
     return res
@@ -1064,8 +1010,7 @@ app.post("/approve", async (req, res) => {
       trace_id,
     });
 
-  if (trace.currentIndex + 1 < trace.steps.length)
-    trace.currentIndex += 1;
+  if (trace.currentIndex + 1 < trace.steps.length) trace.currentIndex += 1;
   await logToSheet({
     type: "approval_approve",
     input_text: trace.title,
@@ -1095,12 +1040,7 @@ app.post("/approve", async (req, res) => {
   }
 });
 app.post("/reject", async (req, res) => {
-  const {
-    trace_id,
-    reason = "",
-    checks = [],
-    by = "api",
-  } = req.body || {};
+  const { trace_id, reason = "", checks = [], by = "api" } = req.body || {};
   const trace = traces.get(trace_id);
   if (!trace)
     return res
@@ -1129,9 +1069,7 @@ app.post("/reject", async (req, res) => {
       `반려자: <b>${by}</b>`,
       `사유: <code>${reason || "-"}</code>`,
       checks.length
-        ? `체크: ${checks
-            .map((k) => labelOf(k))
-            .join(", ")}`
+        ? `체크: ${checks.map((k) => labelOf(k)).join(", ")}`
         : "체크: -",
     ].join("\n");
     await tgSend(
@@ -1171,9 +1109,7 @@ function buildSummaryReport(trace) {
     .map((h) => Number(h.latency_ms || 0))
     .filter((v) => v > 0);
   const avgLatency = vals.length
-    ? Math.round(
-        vals.reduce((a, b) => a + b, 0) / vals.length
-      )
+    ? Math.round(vals.reduce((a, b) => a + b, 0) / vals.length)
     : 0;
   const stepsMark = trace.steps
     .map((s, idx) =>
@@ -1205,10 +1141,8 @@ app.post("/telegram/webhook", async (req, res) => {
     if (cq) {
       const data = cq.data || "";
       const from = cq.from;
-      const chatId =
-        cq.message?.chat?.id || TELEGRAM_ADMIN_CHAT_ID;
-      const answer = (text) =>
-        tgAnswerCallback(cq.id, text, false);
+      const chatId = cq.message?.chat?.id || TELEGRAM_ADMIN_CHAT_ID;
+      const answer = (text) => tgAnswerCallback(cq.id, text, false);
 
       if (data.startsWith("appr:")) {
         const [, tid, step] = data.split(":");
@@ -1219,13 +1153,10 @@ app.post("/telegram/webhook", async (req, res) => {
         }
         const expectedNext = getNextStep(trace);
         if (expectedNext && step && expectedNext !== step) {
-          await answer(
-            `예상 단계와 다릅니다. expected: ${expectedNext}`
-          );
+          await answer(`예상 단계와 다릅니다. expected: ${expectedNext}`);
           return res.json({ ok: true });
         }
-        if (trace.currentIndex + 1 < trace.steps.length)
-          trace.currentIndex += 1;
+        if (trace.currentIndex + 1 < trace.steps.length) trace.currentIndex += 1;
         const approvedBy = approverName(from);
         await logToSheet({
           type: "approval_approve",
@@ -1264,10 +1195,7 @@ app.post("/telegram/webhook", async (req, res) => {
         await logToSheet({
           type: "approval_reject",
           input_text: trace.title,
-          output_text: {
-            by: rejectedBy,
-            reason: "inline_reject",
-          },
+          output_text: { by: rejectedBy, reason: "inline_reject" },
           project: PROJECT,
           category: "approval",
           note: `trace=${trace.id}`,
@@ -1332,16 +1260,13 @@ app.post("/telegram/webhook", async (req, res) => {
     const text = message.text.trim();
 
     if (text.startsWith("/approve") || text.startsWith("/승인")) {
-      const { trace_id, step } =
-        parseTelegramCommand(text);
+      const { trace_id, step } = parseTelegramCommand(text);
       const checks = parseChecks(text);
       const trace = trace_id && traces.get(trace_id);
       if (!trace) {
         await tgSend(
           chatId,
-          `해당 작업을 찾을 수 없습니다.\n${fmtTrace(
-            trace_id
-          )}`
+          `해당 작업을 찾을 수 없습니다.\n${fmtTrace(trace_id)}`
         );
         return res.json({ ok: true });
       }
@@ -1353,8 +1278,7 @@ app.post("/telegram/webhook", async (req, res) => {
         );
         return res.json({ ok: true });
       }
-      if (trace.currentIndex + 1 < trace.steps.length)
-        trace.currentIndex += 1;
+      if (trace.currentIndex + 1 < trace.steps.length) trace.currentIndex += 1;
 
       const approvedBy = approverName(message.from);
       await logToSheet({
@@ -1375,9 +1299,7 @@ app.post("/telegram/webhook", async (req, res) => {
         fmtTrace(trace.id),
         `승인자: <b>${approvedBy}</b>`,
         checks.length
-          ? `체크: ${checks
-              .map((k) => labelOf(k))
-              .join(", ")}`
+          ? `체크: ${checks.map((k) => labelOf(k)).join(", ")}`
           : "체크: -",
         `상태: <b>${trace.status}</b>`,
       ].join("\n");
@@ -1393,16 +1315,13 @@ app.post("/telegram/webhook", async (req, res) => {
     }
 
     if (text.startsWith("/reject") || text.startsWith("/반려")) {
-      const { trace_id, reason = "" } =
-        parseTelegramCommand(text);
+      const { trace_id, reason = "" } = parseTelegramCommand(text);
       const checks = parseChecks(text);
       const trace = trace_id && traces.get(trace_id);
       if (!trace) {
         await tgSend(
           chatId,
-          `해당 작업을 찾을 수 없습니다.\n${fmtTrace(
-            trace_id
-          )}`
+          `해당 작업을 찾을 수 없습니다.\n${fmtTrace(trace_id)}`
         );
         return res.json({ ok: true });
       }
@@ -1428,9 +1347,7 @@ app.post("/telegram/webhook", async (req, res) => {
         `반려자: <b>${rejectedBy}</b>`,
         `사유: <code>${reason || "-"}</code>`,
         checks.length
-          ? `체크: ${checks
-              .map((k) => labelOf(k))
-              .join(", ")}`
+          ? `체크: ${checks.map((k) => labelOf(k)).join(", ")}`
           : "체크: -",
       ].join("\n");
       await tgSend(
@@ -1445,15 +1362,12 @@ app.post("/telegram/webhook", async (req, res) => {
     }
 
     if (text.startsWith("/status") || text.startsWith("/상태")) {
-      const { trace_id } =
-        parseTelegramCommand(text);
+      const { trace_id } = parseTelegramCommand(text);
       const trace = trace_id && traces.get(trace_id);
       if (!trace) {
         await tgSend(
           chatId,
-          `해당 작업을 찾을 수 없습니다.\n${fmtTrace(
-            trace_id
-          )}`
+          `해당 작업을 찾을 수 없습니다.\n${fmtTrace(trace_id)}`
         );
       } else {
         const hist = trace.history
@@ -1477,30 +1391,22 @@ app.post("/telegram/webhook", async (req, res) => {
     }
 
     if (text.startsWith("/report") || text.startsWith("/리포트")) {
-      const { trace_id } =
-        parseTelegramCommand(text);
+      const { trace_id } = parseTelegramCommand(text);
       const trace = trace_id && traces.get(trace_id);
       if (!trace) {
         await tgSend(
           chatId,
-          `해당 작업을 찾을 수 없습니다.\n${fmtTrace(
-            trace_id
-          )}`
+          `해당 작업을 찾을 수 없습니다.\n${fmtTrace(trace_id)}`
         );
         return res.json({ ok: true });
       }
-      await tgSend(
-        chatId,
-        buildSummaryReport(trace),
-        "HTML"
-      );
+      await tgSend(chatId, buildSummaryReport(trace), "HTML");
       return res.json({ ok: true });
     }
 
     // 자연어: 통합 실행
     if (!text.startsWith("/")) {
-      const { title, steps, profile } =
-        parseFreeText(text);
+      const { title, steps, profile } = parseFreeText(text);
       const trace_id = genTraceId();
       const trace = {
         id: trace_id,
@@ -1541,17 +1447,10 @@ app.post("/telegram/webhook", async (req, res) => {
     }
 
     // 기타: 에코
-    await tgSend(
-      chatId,
-      `당신이 보낸 메시지: ${text}`,
-      "HTML"
-    );
+    await tgSend(chatId, `당신이 보낸 메시지: ${text}`, "HTML");
     return res.json({ ok: true });
   } catch (e) {
-    console.error(
-      "❌ /telegram/webhook error:",
-      e?.message
-    );
+    console.error("❌ /telegram/webhook error:", e?.message);
     if (shouldNotify("error")) {
       try {
         await tgSend(
@@ -1575,11 +1474,7 @@ app.post("/", async (req, res) => {
     if (!message || !message.text) return res.sendStatus(200);
     const chatId = message.chat.id;
     const text = message.text;
-    await tgSend(
-      chatId,
-      `당신이 보낸 메시지: ${text}`,
-      "HTML"
-    );
+    await tgSend(chatId, `당신이 보낸 메시지: ${text}`, "HTML");
     await logToSheet({
       chat_id: chatId,
       username: message.from?.username || "",
