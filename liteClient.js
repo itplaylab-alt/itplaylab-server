@@ -1,134 +1,96 @@
-// liteClient.js — ItplayLab LITE 엔진 전용 클라이언트
-// 역할: LITE_SYSTEM_PROMPT + gpt-4o-mini 사용해서 빠른 JSON 응답 생성
+// liteClient.js — LITE 엔진용 OpenAI 래퍼 (Responses API 최신 버전)
 
 import OpenAI from "openai";
 
-const {
-  OPENAI_API_KEY,
-  LITE_SYSTEM_PROMPT,
-  LITE_MODEL = "gpt-4o-mini",
-} = process.env;
+const oa = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
-const oa = new OpenAI({ apiKey: OPENAI_API_KEY });
+const LITE_MODEL = process.env.OPENAI_MODEL_LITE || "gpt-4o-mini";
+const LITE_SYSTEM_PROMPT =
+  process.env.LITE_SYSTEM_PROMPT ||
+  "너는 ItplayLab 자동화 공정에서 동작하는 LITE 엔진이다. JSON 하나만 반환한다.";
 
 /**
- * LITE 전용 호출자
- * @param {string} task  - "brief" | "script" 등 작업명
- * @param {any} payload  - 실제 입력 데이터 (idea, brief 등)
- * @param {object} meta  - pattern_hint 등 부가 메타
+ * LITE 엔진 호출
+ * @param {string} task - "brief" | "script" 등
+ * @param {any} payload - 입력 데이터 (아이디어, 브리프 등)
+ * @param {object} meta - 추가 메타정보
  */
 export async function callLiteGPT(task, payload = {}, meta = {}) {
   const started = Date.now();
 
-  if (!OPENAI_API_KEY) {
-    return {
-      ok: false,
-      output: null,
-      error: {
-        code: "NO_API_KEY",
-        message: "OPENAI_API_KEY missing",
-      },
-      debug: {
-        engine: LITE_MODEL,
-        latency_ms: 0,
-      },
-    };
-  }
-
-  const systemPrompt =
-    LITE_SYSTEM_PROMPT ||
-    "너는 ItplayLab LITE 엔진이다. 항상 JSON 하나만 반환하라.";
-
-  // user 쪽에 전달할 페이로드(문자열)
-  const userInput = JSON.stringify({
-    task,
-    input: payload,
-    meta,
-  });
-
   try {
-    // 🔑 여기서 Responses API 규격을 맞춤
     const resp = await oa.responses.create({
       model: LITE_MODEL,
       input: [
         {
           role: "system",
-          content: [
-            {
-              // *** 중요: Responses는 type: "input_text" 여야 함 ***
-              type: "input_text",
-              text: systemPrompt,
-            },
-          ],
+          content: LITE_SYSTEM_PROMPT,
         },
         {
           role: "user",
-          content: [
-            {
-              type: "input_text",
-              text: userInput,
-            },
-          ],
+          content: JSON.stringify({
+            task,
+            input: payload,
+            meta,
+          }),
         },
       ],
-      response_format: { type: "json_object" },
       temperature: 0.2,
     });
 
-    // 텍스트 꺼내기 (Responses 표준)
-    const txt =
-      resp?.output?.[0]?.content?.[0]?.text || resp?.output_text || "";
+    const latency_ms = Date.now() - started;
 
-    let parsed;
-    try {
-      parsed = txt ? JSON.parse(txt) : null;
-    } catch (e) {
+    const txt =
+      resp?.output_text ||
+      resp?.output?.[0]?.content?.[0]?.text ||
+      "";
+
+    if (!txt) {
       return {
         ok: false,
         output: null,
-        error: {
-          code: "JSON_PARSE_ERROR",
-          message: e.message,
-          raw: txt,
-        },
+        error: "empty_response",
         debug: {
           engine: LITE_MODEL,
-          latency_ms: Date.now() - started,
+          latency_ms,
+          raw_response: resp,
         },
       };
     }
 
-    // LITE_SYSTEM_PROMPT에서 정의한 최상위 구조를 그대로 받는 걸 가정:
-    // { task, ok, output, meta, debug }
-    const outerOk =
-      typeof parsed?.ok === "boolean" ? parsed.ok : true;
+    let parsed = null;
+    let ok = true;
+    let error = null;
+
+    try {
+      parsed = JSON.parse(txt);
+    } catch {
+      ok = false;
+      error = "json_parse_failed";
+    }
 
     return {
-      ok: outerOk,
-      output: parsed?.output ?? parsed,
-      error: outerOk ? null : parsed?.error ?? null,
+      ok,
+      output: parsed || txt,
+      error,
       debug: {
-        engine:
-          parsed?.debug?.engine ||
-          resp?.model ||
-          LITE_MODEL,
-        latency_ms:
-          parsed?.debug?.latency_ms ||
-          Date.now() - started,
+        engine: LITE_MODEL,
+        latency_ms,
+        raw_response: resp,
       },
     };
   } catch (e) {
+    const latency_ms = Date.now() - started;
+    console.error("[callLiteGPT] error:", e?.message || e);
     return {
       ok: false,
       output: null,
-      error: {
-        code: "OPENAI_ERROR",
-        message: e?.message || "unknown_openai_error",
-        details: e?.response?.data,
-      },
+      error: e?.message || String(e),
       debug: {
         engine: LITE_MODEL,
-        latency_ms: Date.now() - started,
+        latency_ms,
       },
     };
   }
