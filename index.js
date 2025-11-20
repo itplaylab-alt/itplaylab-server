@@ -322,6 +322,7 @@ app.get("/dashboard/active", (req, res) => {
 
 /* ────────────────────────────────────────────────────────────
    4) OpenAI 공용 호출자 (Responses → Fallback)
+   ※ 여기서 Responses API 호출 방식을 최신 형식으로 수정
 ──────────────────────────────────────────────────────────── */
 async function callOpenAIJson({
   system,
@@ -335,21 +336,29 @@ async function callOpenAIJson({
   let parsed = null;
 
   try {
+    // ✅ 최신 Responses API 형식 (response_format 대신 response.format)
     const resp = await oa.responses.create({
       model: OPENAI_MODEL || OPENAI_MODEL_RESP,
-      messages: [
+      input: [
         { role: "system", content: system },
         { role: "user", content: user },
       ],
-      response_format: {
-        type: "json_schema",
-        json_schema: { name: schemaName, strict: true, schema },
+      response: {
+        format: {
+          type: "json_schema",
+          json_schema: { name: schemaName, strict: true, schema },
+        },
       },
       temperature: 0.2,
     });
-    txt = resp?.output_text || resp?.output?.[0]?.content?.[0]?.text || "";
+
+    txt =
+      resp?.output_text ||
+      resp?.output?.[0]?.content?.[0]?.text ||
+      "";
     parsed = txt ? JSON.parse(txt) : null;
   } catch (e) {
+    // Fallback: Chat Completions (여긴 response_format 그대로 사용 가능)
     provider = "chat.completions";
     try {
       const schemaHint = `다음 JSON 스키마에 맞춰 정확히 JSON만 출력하세요. 추가 설명 금지.\n${JSON.stringify(
@@ -359,7 +368,10 @@ async function callOpenAIJson({
         model: OPENAI_MODEL_FALLBACK,
         response_format: { type: "json_object" },
         messages: [
-          { role: "system", content: `${system}\n\n${schemaHint}` },
+          {
+            role: "system",
+            content: `${system}\n\n${schemaHint}`,
+          },
           { role: "user", content: user },
         ],
         temperature: 0.2,
@@ -501,11 +513,10 @@ async function aiBriefLite(idea, meta = {}) {
 
   return {
     ok: r.ok,
-    data: r.output, // LITE 브리프 결과
+    data: r.output, // LITE 브리프 결과(문자열 또는 JSON)
     provider: r.debug?.engine || "gpt-4o-mini-lite",
     latency_ms: r.debug?.latency_ms ?? 0,
     raw: r,
-    error: r.error,
   };
 }
 
@@ -517,11 +528,10 @@ async function aiScriptLite(brief, meta = {}) {
 
   return {
     ok: r.ok,
-    data: r.output, // LITE 스크립트 결과
+    data: r.output, // LITE 스크립트 결과(문자열 또는 JSON)
     provider: r.debug?.engine || "gpt-4o-mini-lite",
     latency_ms: r.debug?.latency_ms ?? 0,
     raw: r,
-    error: r.error,
   };
 }
 
@@ -770,10 +780,7 @@ function parseFreeText(text) {
   if (lower.includes("에셋") || lower.includes("메타")) steps = ["assets"];
   const title =
     text
-      .replace(
-        /(브리프|스크립트|에셋|만들어줘|전체|전부|메타|전략)/g,
-        ""
-      )
+      .replace(/(브리프|스크립트|에셋|만들어줘|전체|전부|메타|전략)/g, "")
       .trim() || "무제";
   const profileMatch = text.match(/profile=([\w-]+)/i);
   const profile = profileMatch ? profileMatch[1] : "-";
@@ -809,33 +816,26 @@ app.post("/content/lite/brief", async (req, res) => {
     await logToSheet({
       type: "content_lite_brief",
       input_text: idea.title,
-      output_text: r.data ?? r.raw,
+      output_text: r.data,
       project: PROJECT,
       category: "brief_lite",
       note: "via /content/lite/brief",
       latency_ms: r.latency_ms,
       ok: r.ok,
       provider: r.provider,
-      error: !r.ok ? (r.error || r.raw?.error || "") : "",
     });
 
-    return res.json({
+    res.json({
       ok: r.ok,
       latency_ms: Date.now() - t0,
-      brief: r.data || null,
-      error: r.ok ? null : r.error || r.raw?.error || null,
+      brief: r.data,
       debug: {
         provider: r.provider,
         latency_ms: r.latency_ms,
-        raw_debug: r.raw?.debug || null,
       },
     });
   } catch (e) {
-    console.error("LITE brief error:", e?.message);
-    return res.status(500).json({
-      ok: false,
-      error: e?.message || "lite_openai_error",
-    });
+    res.status(500).json({ ok: false, error: "lite_openai_error" });
   }
 });
 
@@ -849,29 +849,25 @@ app.post("/content/lite/script", async (req, res) => {
     await logToSheet({
       type: "content_lite_script",
       input_text: brief.brief_id || "",
-      output_text: r.data ?? r.raw,
+      output_text: r.data,
       project: PROJECT,
       category: "script_lite",
       note: "via /content/lite/script",
       latency_ms: r.latency_ms,
       ok: r.ok,
       provider: r.provider,
-      error: !r.ok ? (r.error || r.raw?.error || "") : "",
     });
 
     res.json({
       ok: r.ok,
       latency_ms: Date.now() - t0,
-      script: r.data || null,
-      error: r.ok ? null : r.error || r.raw?.error || null,
+      script: r.data,
       debug: {
         provider: r.provider,
         latency_ms: r.latency_ms,
-        raw_debug: r.raw?.debug || null,
       },
     });
   } catch (e) {
-    console.error("LITE script error:", e?.message);
     res.status(500).json({ ok: false, error: "lite_openai_error" });
   }
 });
