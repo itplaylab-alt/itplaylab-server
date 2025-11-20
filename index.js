@@ -1001,6 +1001,62 @@ app.post("/content/run", async (req, res) => {
     });
   }
 });
+// 단순 파이프라인 실행용 엔드포인트 (/content/run 래핑 버전)
+app.post("/content/pipeline", async (req, res) => {
+  if (!requireOpenAI(res)) return;
+  const started = Date.now();
+
+  try {
+    const {
+      title,
+      idea_id,
+      steps = ["brief", "script", "assets"],
+      profile = "default",
+      chatId = TELEGRAM_ADMIN_CHAT_ID,
+    } = req.body || {};
+
+    // title이 없으면 idea_id를 제목으로 사용
+    const finalTitle = title || idea_id;
+    if (!finalTitle) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "title_or_idea_id_required" });
+    }
+
+    const trace_id = genTraceId();
+    const trace = {
+      id: trace_id,
+      createdAt: nowISO(),
+      chatId,
+      title: finalTitle,
+      profile,
+      steps,
+      currentIndex: 0,
+      approvalMode: APPROVAL_MODE,
+      history: [],
+      lastOutput: {},
+      status: "initialized",
+      revisionCount: 0,
+    };
+    traces.set(trace_id, trace);
+
+    await runFromCurrent(trace);
+
+    return res.json({
+      ok: true,
+      latency_ms: Date.now() - started,
+      trace_id,
+      step: trace.steps[trace.currentIndex],
+      status: trace.status,
+    });
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      latency_ms: Date.now() - started,
+      error: String(e?.message || e),
+    });
+  }
+});
 
 /* 승인/반려/상태/리포트 */
 app.post("/approve", async (req, res) => {
