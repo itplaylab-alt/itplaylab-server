@@ -501,10 +501,11 @@ async function aiBriefLite(idea, meta = {}) {
 
   return {
     ok: r.ok,
-    data: r.output,
+    data: r.output, // LITE 브리프 결과
     provider: r.debug?.engine || "gpt-4o-mini-lite",
     latency_ms: r.debug?.latency_ms ?? 0,
     raw: r,
+    error: r.error,
   };
 }
 
@@ -516,10 +517,11 @@ async function aiScriptLite(brief, meta = {}) {
 
   return {
     ok: r.ok,
-    data: r.output,
+    data: r.output, // LITE 스크립트 결과
     provider: r.debug?.engine || "gpt-4o-mini-lite",
     latency_ms: r.debug?.latency_ms ?? 0,
     raw: r,
+    error: r.error,
   };
 }
 
@@ -807,26 +809,33 @@ app.post("/content/lite/brief", async (req, res) => {
     await logToSheet({
       type: "content_lite_brief",
       input_text: idea.title,
-      output_text: r.data,
+      output_text: r.data ?? r.raw,
       project: PROJECT,
       category: "brief_lite",
       note: "via /content/lite/brief",
       latency_ms: r.latency_ms,
       ok: r.ok,
       provider: r.provider,
+      error: !r.ok ? (r.error || r.raw?.error || "") : "",
     });
 
-    res.json({
+    return res.json({
       ok: r.ok,
       latency_ms: Date.now() - t0,
-      brief: r.data,
+      brief: r.data || null,
+      error: r.ok ? null : r.error || r.raw?.error || null,
       debug: {
         provider: r.provider,
         latency_ms: r.latency_ms,
+        raw_debug: r.raw?.debug || null,
       },
     });
   } catch (e) {
-    res.status(500).json({ ok: false, error: "lite_openai_error" });
+    console.error("LITE brief error:", e?.message);
+    return res.status(500).json({
+      ok: false,
+      error: e?.message || "lite_openai_error",
+    });
   }
 });
 
@@ -840,25 +849,29 @@ app.post("/content/lite/script", async (req, res) => {
     await logToSheet({
       type: "content_lite_script",
       input_text: brief.brief_id || "",
-      output_text: r.data,
+      output_text: r.data ?? r.raw,
       project: PROJECT,
       category: "script_lite",
       note: "via /content/lite/script",
       latency_ms: r.latency_ms,
       ok: r.ok,
       provider: r.provider,
+      error: !r.ok ? (r.error || r.raw?.error || "") : "",
     });
 
     res.json({
       ok: r.ok,
       latency_ms: Date.now() - t0,
-      script: r.data,
+      script: r.data || null,
+      error: r.ok ? null : r.error || r.raw?.error || null,
       debug: {
         provider: r.provider,
         latency_ms: r.latency_ms,
+        raw_debug: r.raw?.debug || null,
       },
     });
   } catch (e) {
+    console.error("LITE script error:", e?.message);
     res.status(500).json({ ok: false, error: "lite_openai_error" });
   }
 });
