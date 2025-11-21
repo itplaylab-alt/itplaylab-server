@@ -277,6 +277,68 @@ app.get("/test/notify", async (req, res) => {
   }
 });
 
+/* 3-1) jobRepo 연동 테스트용 라우트
+   - /job/by-trace-id/:id  : 시트에서 ROW 조회
+   - /job/update-video     : 시트에 영상 상태/경로 업데이트
+*/
+app.get("/job/by-trace-id/:trace_id", async (req, res) => {
+  const trace_id = req.params.trace_id;
+  try {
+    const row = await findByTraceId(trace_id);
+    if (!row) {
+      return res
+        .status(404)
+        .json({ ok: false, error: "job_not_found", trace_id });
+    }
+    return res.json({ ok: true, trace_id, row });
+  } catch (e) {
+    console.error("❌ /job/by-trace-id error:", e?.message);
+    return res.status(500).json({
+      ok: false,
+      error: e?.message || "jobRepo_error",
+      trace_id,
+    });
+  }
+});
+
+app.post("/job/update-video", async (req, res) => {
+  const {
+    trace_id,
+    video_status,
+    video_path,
+    video_latency_ms,
+    yt_status,
+    yt_video_id,
+    kpi_grade,
+    error_log,
+  } = req.body || {};
+
+  if (!trace_id) {
+    return res.status(400).json({ ok: false, error: "trace_id_required" });
+  }
+
+  try {
+    const updated = await updateVideoStatus(trace_id, {
+      video_status,
+      video_path,
+      video_latency_ms,
+      yt_status,
+      yt_video_id,
+      kpi_grade,
+      error_log,
+    });
+
+    return res.json({ ok: true, trace_id, row: updated });
+  } catch (e) {
+    console.error("❌ /job/update-video error:", e?.message);
+    return res.status(500).json({
+      ok: false,
+      error: e?.message || "jobRepo_error",
+      trace_id,
+    });
+  }
+});
+
 /* 대시보드 */
 const traces = new Map();
 function getTraceSnapshot(t) {
@@ -323,6 +385,7 @@ app.get("/dashboard/active", (req, res) => {
 
 /* ────────────────────────────────────────────────────────────
    4) OpenAI 공용 호출자 (Responses → Fallback)
+   ※ 여기서 Responses API 호출 방식을 최신 형식으로 수정
 ──────────────────────────────────────────────────────────── */
 async function callOpenAIJson({
   system,
@@ -336,7 +399,7 @@ async function callOpenAIJson({
   let parsed = null;
 
   try {
-    // 최신 Responses API 형식
+    // ✅ 최신 Responses API 형식 (response_format 대신 response.format)
     const resp = await oa.responses.create({
       model: OPENAI_MODEL || OPENAI_MODEL_RESP,
       input: [
@@ -358,7 +421,7 @@ async function callOpenAIJson({
       "";
     parsed = txt ? JSON.parse(txt) : null;
   } catch (e) {
-    // Fallback: Chat Completions
+    // Fallback: Chat Completions (여긴 response_format 그대로 사용 가능)
     provider = "chat.completions";
     try {
       const schemaHint = `다음 JSON 스키마에 맞춰 정확히 JSON만 출력하세요. 추가 설명 금지.\n${JSON.stringify(
@@ -503,7 +566,7 @@ async function aiAssets({ brief_id, script }) {
 }
 
 /* ────────────────────────────────────────────────────────────
-   4-1) LITE AI 작업자
+   4-1) LITE AI 작업자 (패턴 기반, gpt-4o-mini + LITE_SYSTEM_PROMPT)
 ──────────────────────────────────────────────────────────── */
 async function aiBriefLite(idea, meta = {}) {
   const r = await callLiteGPT("brief", idea, {
@@ -513,7 +576,7 @@ async function aiBriefLite(idea, meta = {}) {
 
   return {
     ok: r.ok,
-    data: r.output,
+    data: r.output, // LITE 브리프 결과(문자열 또는 JSON)
     provider: r.debug?.engine || "gpt-4o-mini-lite",
     latency_ms: r.debug?.latency_ms ?? 0,
     raw: r,
@@ -528,7 +591,7 @@ async function aiScriptLite(brief, meta = {}) {
 
   return {
     ok: r.ok,
-    data: r.output,
+    data: r.output, // LITE 스크립트 결과(문자열 또는 JSON)
     provider: r.debug?.engine || "gpt-4o-mini-lite",
     latency_ms: r.debug?.latency_ms ?? 0,
     raw: r,
@@ -1001,7 +1064,6 @@ app.post("/content/run", async (req, res) => {
     });
   }
 });
-
 // 단순 파이프라인 실행용 엔드포인트 (/content/run 래핑 버전)
 app.post("/content/pipeline", async (req, res) => {
   if (!requireOpenAI(res)) return;
@@ -1016,6 +1078,7 @@ app.post("/content/pipeline", async (req, res) => {
       chatId = TELEGRAM_ADMIN_CHAT_ID,
     } = req.body || {};
 
+    // title이 없으면 idea_id를 제목으로 사용
     const finalTitle = title || idea_id;
     if (!finalTitle) {
       return res
