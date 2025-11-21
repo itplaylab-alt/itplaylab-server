@@ -7,6 +7,7 @@ import crypto from "crypto";
 import OpenAI from "openai";
 import { callLiteGPT } from "./liteClient.js";
 import { findByTraceId, updateVideoStatus } from "./src/jobRepo.js";
+
 const app = express();
 
 /* ────────────────────────────────────────────────────────────
@@ -319,6 +320,7 @@ app.get("/dashboard/active", (req, res) => {
   const limit = Math.max(1, Math.min(100, Number(req.query.limit || 20)));
   res.json({ ok: true, ...groupActive(limit) });
 });
+
 /* ────────────────────────────────────────────────────────────
    4) OpenAI 공용 호출자 (Responses → Fallback)
    ※ 여기서 Responses API 호출 방식을 최신 형식으로 수정
@@ -1197,6 +1199,74 @@ function buildSummaryReport(trace) {
 }
 
 /* ────────────────────────────────────────────────────────────
+   7-1) JobRow(Google Sheet) 연동 REST
+   - 영상 공장 쪽에서 Render 서버를 통해 GAS Web App 을 간접 호출
+──────────────────────────────────────────────────────────── */
+
+app.get("/job/by-trace-id", async (req, res) => {
+  try {
+    const { trace_id } = req.query;
+    if (!trace_id) {
+      return res.status(400).json({ ok: false, error: "trace_id required" });
+    }
+
+    const job = await findByTraceId(trace_id);
+    if (!job) {
+      return res
+        .status(404)
+        .json({ ok: false, error: "job_not_found", trace_id });
+    }
+
+    return res.json({ ok: true, trace_id, job });
+  } catch (e) {
+    console.error("GET /job/by-trace-id error:", e?.message);
+    return res.status(500).json({
+      ok: false,
+      error: "server_error",
+      detail: e?.message || String(e),
+    });
+  }
+});
+
+app.post("/job/update-video", async (req, res) => {
+  try {
+    const {
+      trace_id,
+      videoStatus,
+      videoPath,
+      videoLatencyMs,
+      ytStatus,
+      ytVideoId,
+      kpiGrade,
+      errorLog,
+    } = req.body || {};
+
+    if (!trace_id) {
+      return res.status(400).json({ ok: false, error: "trace_id required" });
+    }
+
+    await updateVideoStatus(trace_id, {
+      videoStatus,
+      videoPath,
+      videoLatencyMs,
+      ytStatus,
+      ytVideoId,
+      kpiGrade,
+      errorLog,
+    });
+
+    return res.json({ ok: true, trace_id });
+  } catch (e) {
+    console.error("POST /job/update-video error:", e?.message);
+    return res.status(500).json({
+      ok: false,
+      error: "server_error",
+      detail: e?.message || String(e),
+    });
+  }
+});
+
+/* ────────────────────────────────────────────────────────────
    8) Telegram Webhook
 ──────────────────────────────────────────────────────────── */
 app.post("/telegram/webhook", async (req, res) => {
@@ -1530,6 +1600,7 @@ app.post("/telegram/webhook", async (req, res) => {
     return res.sendStatus(500);
   }
 });
+
 /* 루트 웹훅(에코) */
 app.post("/", async (req, res) => {
   try {
