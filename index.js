@@ -323,7 +323,7 @@ app.get("/dashboard/active", (req, res) => {
 
 /* ────────────────────────────────────────────────────────────
    4) OpenAI 공용 호출자 (Responses → Fallback)
-   ※ 여기서 Responses API 호출 방식을 최신 형식으로 수정
+   ※ 최신 Responses API 형식 사용
 ──────────────────────────────────────────────────────────── */
 async function callOpenAIJson({
   system,
@@ -337,7 +337,6 @@ async function callOpenAIJson({
   let parsed = null;
 
   try {
-    // ✅ 최신 Responses API 형식 (response_format 대신 response.format)
     const resp = await oa.responses.create({
       model: OPENAI_MODEL || OPENAI_MODEL_RESP,
       input: [
@@ -359,7 +358,7 @@ async function callOpenAIJson({
       "";
     parsed = txt ? JSON.parse(txt) : null;
   } catch (e) {
-    // Fallback: Chat Completions (여긴 response_format 그대로 사용 가능)
+    // Fallback: Chat Completions
     provider = "chat.completions";
     try {
       const schemaHint = `다음 JSON 스키마에 맞춰 정확히 JSON만 출력하세요. 추가 설명 금지.\n${JSON.stringify(
@@ -514,7 +513,7 @@ async function aiBriefLite(idea, meta = {}) {
 
   return {
     ok: r.ok,
-    data: r.output, // LITE 브리프 결과(문자열 또는 JSON)
+    data: r.output,
     provider: r.debug?.engine || "gpt-4o-mini-lite",
     latency_ms: r.debug?.latency_ms ?? 0,
     raw: r,
@@ -529,7 +528,7 @@ async function aiScriptLite(brief, meta = {}) {
 
   return {
     ok: r.ok,
-    data: r.output, // LITE 스크립트 결과(문자열 또는 JSON)
+    data: r.output,
     provider: r.debug?.engine || "gpt-4o-mini-lite",
     latency_ms: r.debug?.latency_ms ?? 0,
     raw: r,
@@ -1016,7 +1015,6 @@ app.post("/content/pipeline", async (req, res) => {
       chatId = TELEGRAM_ADMIN_CHAT_ID,
     } = req.body || {};
 
-    // title이 없으면 idea_id를 제목으로 사용
     const finalTitle = title || idea_id;
     if (!finalTitle) {
       return res
@@ -1199,75 +1197,33 @@ function buildSummaryReport(trace) {
 }
 
 /* ────────────────────────────────────────────────────────────
-   7-1) JobRow(Google Sheet) 연동 REST
-   - 영상 공장 쪽에서 Render 서버를 통해 GAS Web App 을 간접 호출
+   8) JOB REPO 브리지 (GAS Web App)
+   - CONTENT_LOG 시트와 통신 테스트 용도
 ──────────────────────────────────────────────────────────── */
-
-app.get("/job/by-trace-id", async (req, res) => {
+app.get("/job/by-trace-id/:trace_id", async (req, res) => {
   try {
-    const { trace_id } = req.query;
-    if (!trace_id) {
-      return res.status(400).json({ ok: false, error: "trace_id required" });
-    }
-
-    const job = await findByTraceId(trace_id);
-    if (!job) {
-      return res
-        .status(404)
-        .json({ ok: false, error: "job_not_found", trace_id });
-    }
-
-    return res.json({ ok: true, trace_id, job });
+    const trace_id = req.params.trace_id;
+    const data = await findByTraceId(trace_id);
+    res.json({ ok: true, trace_id, data });
   } catch (e) {
-    console.error("GET /job/by-trace-id error:", e?.message);
-    return res.status(500).json({
-      ok: false,
-      error: "server_error",
-      detail: e?.message || String(e),
-    });
+    console.error("/job/by-trace-id error:", e?.message);
+    res.status(500).json({ ok: false, error: e?.message });
   }
 });
 
 app.post("/job/update-video", async (req, res) => {
   try {
-    const {
-      trace_id,
-      videoStatus,
-      videoPath,
-      videoLatencyMs,
-      ytStatus,
-      ytVideoId,
-      kpiGrade,
-      errorLog,
-    } = req.body || {};
-
-    if (!trace_id) {
-      return res.status(400).json({ ok: false, error: "trace_id required" });
-    }
-
-    await updateVideoStatus(trace_id, {
-      videoStatus,
-      videoPath,
-      videoLatencyMs,
-      ytStatus,
-      ytVideoId,
-      kpiGrade,
-      errorLog,
-    });
-
-    return res.json({ ok: true, trace_id });
+    const payload = req.body || {};
+    const data = await updateVideoStatus(payload);
+    res.json({ ok: true, data });
   } catch (e) {
-    console.error("POST /job/update-video error:", e?.message);
-    return res.status(500).json({
-      ok: false,
-      error: "server_error",
-      detail: e?.message || String(e),
-    });
+    console.error("/job/update-video error:", e?.message);
+    res.status(500).json({ ok: false, error: e?.message });
   }
 });
 
 /* ────────────────────────────────────────────────────────────
-   8) Telegram Webhook
+   9) Telegram Webhook
 ──────────────────────────────────────────────────────────── */
 app.post("/telegram/webhook", async (req, res) => {
   try {
