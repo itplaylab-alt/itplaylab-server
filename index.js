@@ -6,7 +6,7 @@ import axios from "axios";
 import crypto from "crypto";
 import OpenAI from "openai";
 import { callLiteGPT } from "./liteClient.js";
-
+import { findByTraceId, updateVideoStatus } from "./src/jobRepo.js";
 const app = express();
 
 /* ────────────────────────────────────────────────────────────
@@ -319,7 +319,6 @@ app.get("/dashboard/active", (req, res) => {
   const limit = Math.max(1, Math.min(100, Number(req.query.limit || 20)));
   res.json({ ok: true, ...groupActive(limit) });
 });
-
 /* ────────────────────────────────────────────────────────────
    4) OpenAI 공용 호출자 (Responses → Fallback)
    ※ 여기서 Responses API 호출 방식을 최신 형식으로 수정
@@ -1531,7 +1530,6 @@ app.post("/telegram/webhook", async (req, res) => {
     return res.sendStatus(500);
   }
 });
-
 /* 루트 웹훅(에코) */
 app.post("/", async (req, res) => {
   try {
