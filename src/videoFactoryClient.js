@@ -1,6 +1,7 @@
 import axios from "axios";
 import { updateVideoStatus } from "./jobRepo.js";
-const { logEvent, logError } = require('../logger');
+import { logEvent, logError } from "../logger.js";
+
 const VIDEO_FACTORY_ENDPOINT =
   process.env.VIDEO_FACTORY_ENDPOINT ||
   "https://example.com/video-factory";
