@@ -17,21 +17,23 @@ if (!GAS_WEB_URL) {
  * @returns {object|null}
  */
 export async function findByTraceId(traceId) {
+
   try {
-    const url = `${GAS_WEB_URL}?action=find&trace_id=${traceId}`;
+    const url = `${GAS_WEB_URL}?action=jobByTraceId&trace_id=${traceId}`;
     const res = await axios.get(url);
 
-    if (!res.data || !res.data.ok) {
-      console.log("[jobRepo] 조회 실패:", res.data);
+    if (!res.data || !res.data.success) {
+      console.log("[jobRepo] findByTraceId 실패:", res.data);
       return null;
     }
 
-    return res.data.jobRow; // GAS에서 돌려주는 JobRow JSON
+    return res.data.job;
   } catch (err) {
     console.error("[jobRepo] findByTraceId 오류:", err.message);
     return null;
   }
 }
+
 
 /**
  * JobRow의 status / step / checks 등을 업데이트
