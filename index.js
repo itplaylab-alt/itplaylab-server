@@ -214,6 +214,16 @@ async function tgAnswerCallback(id, text = "", show_alert = false) {
     console.error("Telegram answerCallbackQuery error:", e?.message);
   }
 }
+// === VIDEO_STATIC_START ===
+// 🔥 v0.1: /videos 정적 파일 제공
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+app.use("/videos", express.static(path.join(__dirname, "videos")));
+// === VIDEO_STATIC_END ===
 
 /* ────────────────────────────────────────────────────────────
    3) 테스트 라우트
