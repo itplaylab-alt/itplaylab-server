@@ -8,6 +8,7 @@ import OpenAI from "openai";
 import { callLiteGPT } from "./liteClient.js";
 import { findByTraceId, updateVideoStatus } from "./src/jobRepo.js";
 import { startVideoGeneration } from "./src/videoFactoryClient.js";
+
 const app = express();
 
 /* ────────────────────────────────────────────────────────────
@@ -1286,25 +1287,39 @@ app.post("/telegram/webhook", async (req, res) => {
         }
         if (trace.currentIndex + 1 < trace.steps.length) trace.currentIndex += 1;
         const approvedBy = approverName(from);
-        await logToSheet({
-          type: "approval_approve",
-          input_text: trace.title,
-          output_text: { by: approvedBy, checks: ["inline"] },
-          project: PROJECT,
-          category: "approval",
-          note: `trace=${trace.id}`,
-          trace_id: trace.id,
-          step: trace.steps[trace.currentIndex],
-          ok: true,
-        });
-        await answer("✅ 승인 처리됨");
-        await tgSend(
-          chatId,
-          `✅ <b>승인 처리</b>\n${fmtTitle(
-            trace.title
-          )}\n${fmtTrace(trace.id)}\n다음 단계 진행합니다.`,
-          "HTML"
-        );
+
+  await logToSheet({
+    type: "approval_approve",
+    input_text: trace.title,
+    output_text: { by: approvedBy, checks: ["inline"] },
+    project: PROJECT,
+    category: "approval",
+    note: `trace=${trace.id}`,
+    trace_id: trace.id,
+    step: trace.steps[trace.currentIndex],
+    ok: true,
+  });
+
+  // 🔥 승인 후 mock 영상 생성 시작
+  try {
+    await startVideoGeneration(trace.id);
+  } catch (err) {
+    console.error(
+      "[VideoFactory] Failed to start video generation:",
+      err?.message || err
+    );
+    // 영상 생성 시작에 실패해도 승인/다음 단계 흐름은 그대로 진행
+  }
+
+  await answer("✅ 승인 처리됨");
+  await tgSend(
+    chatId,
+    `✅ <b>승인 처리</b>\n${fmtTitle(
+      trace.title
+    )}\n${fmtTrace(trace.id)}\n다음 단계 진행합니다.`,
+    "HTML"
+  );
+
         try {
           await runFromCurrent(trace);
         } catch {}
