@@ -1657,7 +1657,8 @@ app.get("/test-gas", async (req, res) => {
 // index.js 하단부, 기존 app.get(...), app.post(...) 들 있는 부분에 추가
 
 // ⚠️ 필요하면 환경변수로 dev에서만 열어두기
-const IS_DEV = process.env.NODE_ENV !== "production";
+const IS_DEV = true;   // 테스트용: dev 라우트 항상 활성화
+
 
 /**
  * DEV 1) video_status 업데이트 테스트
