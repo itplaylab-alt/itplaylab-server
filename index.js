@@ -7,7 +7,7 @@ import crypto from "crypto";
 import OpenAI from "openai";
 import { callLiteGPT } from "./liteClient.js";
 import { findByTraceId, updateVideoStatus } from "./src/jobRepo.js";
-
+import { startVideoGeneration } from "./src/videoFactoryClient.js";
 const app = express();
 
 /* ────────────────────────────────────────────────────────────
@@ -1654,6 +1654,136 @@ app.get("/test-gas", async (req, res) => {
     return res.status(500).send("GAS ERROR");
   }
 });
+// index.js 하단부, 기존 app.get(...), app.post(...) 들 있는 부분에 추가
+
+// ⚠️ 필요하면 환경변수로 dev에서만 열어두기
+const IS_DEV = process.env.NODE_ENV !== "production";
+
+/**
+ * DEV 1) video_status 업데이트 테스트
+ * GET /dev/test-video-status?trace_id=trc_xxxx&status=video_generating
+ */
+if (IS_DEV) {
+  app.get("/dev/test-video-status", async (req, res) => {
+    const traceId = req.query.trace_id;
+    const status = req.query.status || "video_generating";
+
+    if (!traceId) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "trace_id query param required" });
+    }
+
+    try {
+      const result = await updateVideoStatus(traceId, status);
+      return res.json({ ok: true, traceId, status, result });
+    } catch (err) {
+      console.error("GET /dev/test-video-status error:", err);
+      return res
+        .status(500)
+        .json({ ok: false, error: err.message || "internal_error" });
+    }
+  });
+
+  /**
+   * DEV 2) video-factory callback 직접 호출 테스트 (성공)
+   * POST /dev/test-callback-done
+   * body: { trace_id, video_url?, thumbnail_url?, duration? }
+   */
+  app.post("/dev/test-callback-done", async (req, res) => {
+    const {
+      trace_id: traceId,
+      video_url,
+      thumbnail_url,
+      duration,
+    } = req.body || {};
+
+    if (!traceId) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "trace_id required in body" });
+    }
+
+    try {
+      // 실제 콜백 라우트로 내부에서 proxy 호출하는 방식으로 재사용도 가능하지만
+      // 테스트용으로는 로직을 한 번 더 적어줘도 OK
+      await updateVideoStatus(traceId, "video_done", {
+        video_url,
+        video_thumbnail_url: thumbnail_url,
+        video_duration_sec: duration,
+      });
+
+      await updateVideoStatus(traceId, "upload_pending");
+
+      return res.json({
+        ok: true,
+        traceId,
+        status: "video_done → upload_pending",
+      });
+    } catch (err) {
+      console.error("POST /dev/test-callback-done error:", err);
+      return res
+        .status(500)
+        .json({ ok: false, error: err.message || "internal_error" });
+    }
+  });
+
+  /**
+   * DEV 3) video-factory callback 직접 호출 테스트 (실패)
+   * POST /dev/test-callback-failed
+   * body: { trace_id, error_message? }
+   */
+  app.post("/dev/test-callback-failed", async (req, res) => {
+    const { trace_id: traceId, error_message } = req.body || {};
+
+    if (!traceId) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "trace_id required in body" });
+    }
+
+    try {
+      await updateVideoStatus(traceId, "video_failed", {
+        video_error_message: error_message || "mock error from dev route",
+      });
+
+      return res.json({
+        ok: true,
+        traceId,
+        status: "video_failed",
+      });
+    } catch (err) {
+      console.error("POST /dev/test-callback-failed error:", err);
+      return res
+        .status(500)
+        .json({ ok: false, error: err.message || "internal_error" });
+    }
+  });
+
+  /**
+   * DEV 4) startVideoGeneration 단독 테스트
+   * GET /dev/test-start-video?trace_id=trc_xxxx
+   */
+  app.get("/dev/test-start-video", async (req, res) => {
+    const traceId = req.query.trace_id;
+
+    if (!traceId) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "trace_id query param required" });
+    }
+
+    try {
+      await startVideoGeneration(traceId);
+      return res.json({ ok: true, traceId });
+    } catch (err) {
+      console.error("GET /dev/test-start-video error:", err);
+      return res
+        .status(500)
+        .json({ ok: false, error: err.message || "internal_error" });
+    }
+  });
+}
 
 const PORT = process.env.PORT || 10000;
 
