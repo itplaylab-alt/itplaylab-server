@@ -1,8 +1,5 @@
 // liteClient.js — LITE 엔진용 OpenAI 래퍼 (chat.completions + json_object)
 
-import dotenv from "dotenv";
-dotenv.config({ path: "C:/itplaylab-secrets/openai.env" });
-
 import OpenAI from "openai";
 
 const oa = new OpenAI({
