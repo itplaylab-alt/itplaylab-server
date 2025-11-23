@@ -11,6 +11,7 @@
     "express": "^4.19.2",
     "axios": "^1.6.7",
     "openai": "^4.0.0",
-    "googleapis": "^132.0.0"
+    "googleapis": "^132.0.0",
+    "dotenv": "^16.4.5"
   }
 }
