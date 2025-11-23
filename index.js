@@ -1,6 +1,9 @@
 // index.js — ItplayLab 운영 통합본 (테스트 라우트 + 승인 루프 + GAS 로깅 + Telegram + OpenAI)
 // Node 18+ / ESM. 필요한 패키지: express, axios, openai (AJV는 없으면 자동 스킵)
 
+import dotenv from "dotenv";
+dotenv.config();
+
 import express from "express";
 import axios from "axios";
 import crypto from "crypto";
