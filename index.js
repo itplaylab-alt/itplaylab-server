@@ -1313,9 +1313,6 @@ app.get('/test/gas-log', async (req, res) => {
 app.post("/telegram/webhook", async (req, res) => {
   try {
     const cq = req.body?.callback_query;
-app.post("/telegram/webhook", async (req, res) => {
-  try {
-    const cq = req.body?.callback_query;
 
     // --------------------------------------------------
     // Telegram → GAS 공용 로깅
@@ -1344,89 +1341,94 @@ app.post("/telegram/webhook", async (req, res) => {
       });
     } catch (logErr) {
       console.error("[telegram/webhook] logToSheet error:", logErr);
-      // 로깅 실패해도 웹훅 동작은 계속
+      // 로깅 실패해도 웹훅 동작은 계속 진행
     }
-    // --------------------------------------------------
-    // 여기까지 새로 추가된 블록
-    // --------------------------------------------------
 
+    // --------------------------------------------------
+    // 1) callback_query 처리 (버튼 눌렀을 때)
+    // --------------------------------------------------
     if (cq) {
       const data = cq.data || "";
       const from = cq.from;
       const chatId = cq.message?.chat?.id || TELEGRAM_ADMIN_CHAT_ID;
       const answer = (text) => tgAnswerCallback(cq.id, text, false);
 
-      // 👇 이하 기존 코드 그대로 유지
-      ...
-     
-    if (cq) {
-      const data = cq.data || "";
-      const from = cq.from;
-      const chatId = cq.message?.chat?.id || TELEGRAM_ADMIN_CHAT_ID;
-      const answer = (text) => tgAnswerCallback(cq.id, text, false);
-
+      // ✅ 인라인 승인(appr:...) 버튼
       if (data.startsWith("appr:")) {
         const [, tid, step] = data.split(":");
         const trace = traces.get(tid);
+
         if (!trace) {
           await answer("작업을 찾을 수 없습니다.");
           return res.json({ ok: true });
         }
+
         const expectedNext = getNextStep(trace);
         if (expectedNext && step && expectedNext !== step) {
           await answer(`예상 단계와 다릅니다. expected: ${expectedNext}`);
           return res.json({ ok: true });
         }
-        if (trace.currentIndex + 1 < trace.steps.length) trace.currentIndex += 1;
+
+        if (trace.currentIndex + 1 < trace.steps.length) {
+          trace.currentIndex += 1;
+        }
+
         const approvedBy = approverName(from);
 
-  await logToSheet({
-    type: "approval_approve",
-    input_text: trace.title,
-    output_text: { by: approvedBy, checks: ["inline"] },
-    project: PROJECT,
-    category: "approval",
-    note: `trace=${trace.id}`,
-    trace_id: trace.id,
-    step: trace.steps[trace.currentIndex],
-    ok: true,
-  });
+        await logToSheet({
+          type: "approval_approve",
+          input_text: trace.title,
+          output_text: { by: approvedBy, checks: ["inline"] },
+          project: PROJECT,
+          category: "approval",
+          note: `trace=${trace.id}`,
+          trace_id: trace.id,
+          step: trace.steps[trace.currentIndex],
+          ok: true,
+        });
 
-  // 🔥 승인 후 mock 영상 생성 시작
-  try {
-    await startVideoGeneration(trace.id);
-  } catch (err) {
-    console.error(
-      "[VideoFactory] Failed to start video generation:",
-      err?.message || err
-    );
-    // 영상 생성 시작에 실패해도 승인/다음 단계 흐름은 그대로 진행
-  }
+        // 🔥 승인 후 mock 영상 생성 시도
+        try {
+          await startVideoGeneration(trace.id);
+        } catch (err) {
+          console.error(
+            "[VideoFactory] Failed to start video generation:",
+            err?.message || err
+          );
+          // 영상 생성 실패해도 승인/다음 단계 진행은 계속
+        }
 
-  await answer("✅ 승인 처리됨");
-  await tgSend(
-    chatId,
-    `✅ <b>승인 처리</b>\n${fmtTitle(
-      trace.title
-    )}\n${fmtTrace(trace.id)}\n다음 단계 진행합니다.`,
-    "HTML"
-  );
+        await answer("✅ 승인 처리됨");
+        await tgSend(
+          chatId,
+          `✅ <b>승인 처리</b>\n${fmtTitle(
+            trace.title
+          )}\n${fmtTrace(trace.id)}\n다음 단계 진행합니다.`,
+          "HTML"
+        );
 
         try {
           await runFromCurrent(trace);
-        } catch {}
+        } catch (err) {
+          console.error("[runFromCurrent] error:", err);
+        }
+
         return res.json({ ok: true });
       }
 
+      // ❌ 인라인 반려(rej:...) 버튼
       if (data.startsWith("rej:")) {
         const [, tid] = data.split(":");
         const trace = traces.get(tid);
+
         if (!trace) {
           await answer("작업을 찾을 수 없습니다.");
           return res.json({ ok: true });
         }
+
         trace.status = "rejected";
         const rejectedBy = approverName(from);
+
         await logToSheet({
           type: "approval_reject",
           input_text: trace.title,
@@ -1439,7 +1441,9 @@ app.post("/telegram/webhook", async (req, res) => {
           ok: false,
           error: "REJECTED:inline",
         });
+
         await answer("❌ 반려 처리됨");
+
         const msg = [
           fmtTitle(trace.title),
           fmtTrace(trace.id),
@@ -1447,6 +1451,7 @@ app.post("/telegram/webhook", async (req, res) => {
           `반려자: <b>${rejectedBy}</b>`,
           `사유: <code>inline_reject</code>`,
         ].join("\n");
+
         await tgSend(
           chatId,
           buildNotifyMessage({
@@ -1455,16 +1460,20 @@ app.post("/telegram/webhook", async (req, res) => {
             message: msg,
           })
         );
+
         return res.json({ ok: true });
       }
 
+      // ℹ️ 상태 조회(stat:...) 버튼
       if (data.startsWith("stat:")) {
         const [, tid] = data.split(":");
         const trace = traces.get(tid);
+
         if (!trace) {
           await answer("작업을 찾을 수 없습니다.");
           return res.json({ ok: true });
         }
+
         const hist = trace.history
           .map(
             (h) =>
@@ -1473,6 +1482,7 @@ app.post("/telegram/webhook", async (req, res) => {
               }(${h.latency_ms ?? 0}ms/${h.provider || "-"})`
           )
           .join(" → ");
+
         const msg = [
           fmtTitle(trace.title),
           fmtTrace(trace.id),
@@ -1480,24 +1490,35 @@ app.post("/telegram/webhook", async (req, res) => {
           `현재 위치: index ${trace.currentIndex}/${trace.steps.length}`,
           `상태: <b>${trace.status}</b>`,
         ].join("\n");
+
         await answer("ℹ️ 상태 전송");
         await tgSend(chatId, msg, "HTML");
+
         return res.json({ ok: true });
       }
 
+      // 처리되지 않은 버튼
       await answer("처리되지 않은 버튼");
       return res.json({ ok: true });
     }
 
+    // --------------------------------------------------
+    // 2) 일반 메시지 처리 (슬래시 명령 & 자연어)
+    // --------------------------------------------------
     const message = req.body?.message;
-    if (!message || !message.text) return res.sendStatus(200);
+    if (!message || !message.text) {
+      return res.sendStatus(200);
+    }
+
     const chatId = message.chat.id;
     const text = message.text.trim();
 
+    // /approve, /승인
     if (text.startsWith("/approve") || text.startsWith("/승인")) {
       const { trace_id, step } = parseTelegramCommand(text);
       const checks = parseChecks(text);
       const trace = trace_id && traces.get(trace_id);
+
       if (!trace) {
         await tgSend(
           chatId,
@@ -1505,6 +1526,7 @@ app.post("/telegram/webhook", async (req, res) => {
         );
         return res.json({ ok: true });
       }
+
       const expectedNext = getNextStep(trace);
       if (step && expectedNext && step !== expectedNext) {
         await tgSend(
@@ -1513,9 +1535,13 @@ app.post("/telegram/webhook", async (req, res) => {
         );
         return res.json({ ok: true });
       }
-      if (trace.currentIndex + 1 < trace.steps.length) trace.currentIndex += 1;
+
+      if (trace.currentIndex + 1 < trace.steps.length) {
+        trace.currentIndex += 1;
+      }
 
       const approvedBy = approverName(message.from);
+
       await logToSheet({
         type: "approval_approve",
         input_text: trace.title,
@@ -1527,6 +1553,7 @@ app.post("/telegram/webhook", async (req, res) => {
         step: trace.steps[trace.currentIndex],
         ok: true,
       });
+
       await runFromCurrent(trace);
 
       const msg = [
@@ -1538,6 +1565,7 @@ app.post("/telegram/webhook", async (req, res) => {
           : "체크: -",
         `상태: <b>${trace.status}</b>`,
       ].join("\n");
+
       await tgSend(
         chatId,
         buildNotifyMessage({
@@ -1546,13 +1574,16 @@ app.post("/telegram/webhook", async (req, res) => {
           message: msg,
         })
       );
+
       return res.json({ ok: true });
     }
 
+    // /reject, /반려
     if (text.startsWith("/reject") || text.startsWith("/반려")) {
       const { trace_id, reason = "" } = parseTelegramCommand(text);
       const checks = parseChecks(text);
       const trace = trace_id && traces.get(trace_id);
+
       if (!trace) {
         await tgSend(
           chatId,
@@ -1560,9 +1591,12 @@ app.post("/telegram/webhook", async (req, res) => {
         );
         return res.json({ ok: true });
       }
+
       trace.status = "rejected";
       trace.rejectReason = reason;
+
       const rejectedBy = approverName(message.from);
+
       await logToSheet({
         type: "approval_reject",
         input_text: trace.title,
@@ -1575,6 +1609,7 @@ app.post("/telegram/webhook", async (req, res) => {
         ok: false,
         error: `REJECTED: ${reason}`,
       });
+
       const msg = [
         fmtTitle(trace.title),
         fmtTrace(trace.id),
@@ -1585,6 +1620,7 @@ app.post("/telegram/webhook", async (req, res) => {
           ? `체크: ${checks.map((k) => labelOf(k)).join(", ")}`
           : "체크: -",
       ].join("\n");
+
       await tgSend(
         chatId,
         buildNotifyMessage({
@@ -1593,12 +1629,15 @@ app.post("/telegram/webhook", async (req, res) => {
           message: msg,
         })
       );
+
       return res.json({ ok: true });
     }
 
+    // /status, /상태
     if (text.startsWith("/status") || text.startsWith("/상태")) {
       const { trace_id } = parseTelegramCommand(text);
       const trace = trace_id && traces.get(trace_id);
+
       if (!trace) {
         await tgSend(
           chatId,
@@ -1613,6 +1652,7 @@ app.post("/telegram/webhook", async (req, res) => {
               }(${h.latency_ms ?? 0}ms/${h.provider || "-"})`
           )
           .join(" → ");
+
         const msg = [
           fmtTitle(trace.title),
           fmtTrace(trace.id),
@@ -1620,14 +1660,18 @@ app.post("/telegram/webhook", async (req, res) => {
           `현재 위치: index ${trace.currentIndex}/${trace.steps.length}`,
           `상태: <b>${trace.status}</b>`,
         ].join("\n");
+
         await tgSend(chatId, msg, "HTML");
       }
+
       return res.json({ ok: true });
     }
 
+    // /report, /리포트
     if (text.startsWith("/report") || text.startsWith("/리포트")) {
       const { trace_id } = parseTelegramCommand(text);
       const trace = trace_id && traces.get(trace_id);
+
       if (!trace) {
         await tgSend(
           chatId,
@@ -1635,11 +1679,12 @@ app.post("/telegram/webhook", async (req, res) => {
         );
         return res.json({ ok: true });
       }
+
       await tgSend(chatId, buildSummaryReport(trace), "HTML");
       return res.json({ ok: true });
     }
 
-    // 자연어: 통합 실행
+    // 자연어 요청 (트레이스 생성)
     if (!text.startsWith("/")) {
       const { title, steps, profile } = parseFreeText(text);
       const trace_id = genTraceId();
@@ -1657,7 +1702,9 @@ app.post("/telegram/webhook", async (req, res) => {
         status: "initialized",
         revisionCount: 0,
       };
+
       traces.set(trace_id, trace);
+
       await tgSend(
         chatId,
         buildNotifyMessage({
@@ -1666,9 +1713,13 @@ app.post("/telegram/webhook", async (req, res) => {
           message: `${fmtTrace(trace_id)}`,
         })
       );
+
       try {
         await runFromCurrent(trace);
-      } catch {}
+      } catch (err) {
+        console.error("[runFromCurrent] error:", err);
+      }
+
       await logToSheet({
         type: "telegram_text",
         input_text: text,
@@ -1678,10 +1729,11 @@ app.post("/telegram/webhook", async (req, res) => {
         note: `trace=${trace_id}`,
         trace_id,
       });
+
       return res.json({ ok: true });
     }
 
-    // 기타: 에코
+    // 기타: 단순 에코
     await tgSend(chatId, `당신이 보낸 메시지: ${text}`, "HTML");
     return res.json({ ok: true });
   } catch (e) {
@@ -1696,7 +1748,9 @@ app.post("/telegram/webhook", async (req, res) => {
             message: e?.message || "unknown",
           })
         );
-      } catch {}
+      } catch (err) {
+        console.error("tgSend admin error:", err);
+      }
     }
     return res.sendStatus(500);
   }
@@ -1707,8 +1761,10 @@ app.post("/", async (req, res) => {
   try {
     const message = req.body?.message;
     if (!message || !message.text) return res.sendStatus(200);
+
     const chatId = message.chat.id;
     const text = message.text;
+
     await tgSend(chatId, `당신이 보낸 메시지: ${text}`, "HTML");
     await logToSheet({
       chat_id: chatId,
@@ -1720,6 +1776,7 @@ app.post("/", async (req, res) => {
       category: "chat",
       note: "root webhook",
     });
+
     res.sendStatus(200);
   } catch (e) {
     console.error("❌ webhook error:", e?.message);
@@ -1761,11 +1818,9 @@ app.get("/test-gas", async (req, res) => {
     return res.status(500).send("GAS ERROR");
   }
 });
-// index.js 하단부, 기존 app.get(...), app.post(...) 들 있는 부분에 추가
 
-// ⚠️ 필요하면 환경변수로 dev에서만 열어두기
-const IS_DEV = true;   // 테스트용: dev 라우트 항상 활성화
-
+// ⚠️ 필요하면 환경변수로 dev 여부 제어
+const IS_DEV = true;
 
 /**
  * DEV 1) video_status 업데이트 테스트
@@ -1813,8 +1868,6 @@ if (IS_DEV) {
     }
 
     try {
-      // 실제 콜백 라우트로 내부에서 proxy 호출하는 방식으로 재사용도 가능하지만
-      // 테스트용으로는 로직을 한 번 더 적어줘도 OK
       await updateVideoStatus(traceId, "video_done", {
         video_url,
         video_thumbnail_url: thumbnail_url,
@@ -1852,7 +1905,8 @@ if (IS_DEV) {
 
     try {
       await updateVideoStatus(traceId, "video_failed", {
-        video_error_message: error_message || "mock error from dev route",
+        video_error_message:
+          error_message || "mock error from dev route",
       });
 
       return res.json({
@@ -1900,3 +1954,4 @@ app.listen(PORT, () => {
     `🚀 Server is running on port ${PORT} (approval_mode=${APPROVAL_MODE})`
   );
 });
+
