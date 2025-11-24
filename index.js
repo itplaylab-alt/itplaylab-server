@@ -1277,6 +1277,39 @@ function buildSummaryReport(trace) {
 /* ────────────────────────────────────────────────────────────
    8) Telegram Webhook
 ──────────────────────────────────────────────────────────── */
+// --------------------------------------------------------------
+// 테스트용 GAS 로깅 엔드포인트
+// --------------------------------------------------------------
+app.get('/test/gas-log', async (req, res) => {
+  try {
+    const result = await logToSheet({
+      chat_id: 'render_test_chat',
+      username: 'render_server',
+      type: 'render_test_v0_1',
+      input_text: 'hello_from_/test/gas-log',
+      ts: new Date().toISOString(),
+    });
+
+    return res.status(result.ok ? 200 : 500).json({
+      from: 'render',
+      endpoint: '/test/gas-log',
+      gas_ingest_url: GAS_INGEST_URL,
+      payload_example: {
+        chat_id: 'render_test_chat',
+        username: 'render_server',
+        type: 'render_test_v0_1',
+        input_text: 'hello_from_/test/gas-log',
+      },
+      result,
+    });
+  } catch (err) {
+    console.error('[GET /test/gas-log] error:', err);
+    return res.status(500).json({
+      ok: false,
+      error: err.message,
+    });
+  }
+});
 app.post("/telegram/webhook", async (req, res) => {
   try {
     const cq = req.body?.callback_query;
