@@ -1312,37 +1312,40 @@ app.get('/test/gas-log', async (req, res) => {
 });
 app.post("/telegram/webhook", async (req, res) => {
   try {
-    const cq = req.body?.callback_query;
 
-    // --------------------------------------------------
-    // Telegram → GAS 공용 로깅
-    // --------------------------------------------------
-    try {
-      const body = req.body || {};
-      const msg = body.message || body.edited_message || cq?.message || {};
+// --------------------------------------------------------------
+// Telegram → GAS 공용 로깅
+// --------------------------------------------------------------
+try {
+  const body = req.body || {};
+  const cq = body.callback_query;
+  const msg = body.message || body.edited_message || cq?.message || {};
 
-      const fromAll = cq?.from || msg.from || {};
-      const chatForLog = msg.chat || {};
+  const fromAll = cq?.from || msg.from || {};
+  const chatForLog = msg.chat || cq?.message?.chat || {};
 
-      const chatIdForLog = chatForLog.id || TELEGRAM_ADMIN_CHAT_ID;
-      const usernameForLog =
-        fromAll.username ||
-        [fromAll.first_name, fromAll.last_name].filter(Boolean).join(" ") ||
-        "unknown";
+  const chatIdForLog = chatForLog.id || TELEGRAM_ADMIN_CHAT_ID;
+  const usernameForLog =
+    fromAll.username ||
+    [fromAll.first_name, fromAll.last_name].filter(Boolean).join(" ") ||
+    "unknown";
 
-      const textForLog = cq?.data || msg.text || "";
+  const textForLog = (cq?.data || msg.text || "").trim();
 
-      await logToSheet({
-        chat_id: chatIdForLog,
-        username: usernameForLog,
-        type: cq ? "tg_callback" : "tg_message",
-        input_text: textForLog,
-        pipeline_stage: "telegram_webhook",
-      });
-    } catch (logErr) {
-      console.error("[telegram/webhook] logToSheet error:", logErr);
-      // 로깅 실패해도 웹훅 동작은 계속 진행
-    }
+  // Telegram → GAS 로깅 (fire & forget)
+  logToSheet({
+    chat_id: chatIdForLog,
+    username: usernameForLog,
+    type: "telegram_webhook",
+    input_text: textForLog,
+    pipeline_stage: "telegram_webhook",
+  }).catch((err) => {
+    console.error("[telegram webhook] logToSheet error:", err);
+  });
+} catch (err) {
+  console.error("[telegram webhook] logging block failed:", err);
+}
+
 
     // --------------------------------------------------
     // 1) callback_query 처리 (버튼 눌렀을 때)
