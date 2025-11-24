@@ -1313,6 +1313,52 @@ app.get('/test/gas-log', async (req, res) => {
 app.post("/telegram/webhook", async (req, res) => {
   try {
     const cq = req.body?.callback_query;
+app.post("/telegram/webhook", async (req, res) => {
+  try {
+    const cq = req.body?.callback_query;
+
+    // --------------------------------------------------
+    // Telegram → GAS 공용 로깅
+    // --------------------------------------------------
+    try {
+      const body = req.body || {};
+      const msg = body.message || body.edited_message || cq?.message || {};
+
+      const fromAll = cq?.from || msg.from || {};
+      const chatForLog = msg.chat || {};
+
+      const chatIdForLog = chatForLog.id || TELEGRAM_ADMIN_CHAT_ID;
+      const usernameForLog =
+        fromAll.username ||
+        [fromAll.first_name, fromAll.last_name].filter(Boolean).join(" ") ||
+        "unknown";
+
+      const textForLog = cq?.data || msg.text || "";
+
+      await logToSheet({
+        chat_id: chatIdForLog,
+        username: usernameForLog,
+        type: cq ? "tg_callback" : "tg_message",
+        input_text: textForLog,
+        pipeline_stage: "telegram_webhook",
+      });
+    } catch (logErr) {
+      console.error("[telegram/webhook] logToSheet error:", logErr);
+      // 로깅 실패해도 웹훅 동작은 계속
+    }
+    // --------------------------------------------------
+    // 여기까지 새로 추가된 블록
+    // --------------------------------------------------
+
+    if (cq) {
+      const data = cq.data || "";
+      const from = cq.from;
+      const chatId = cq.message?.chat?.id || TELEGRAM_ADMIN_CHAT_ID;
+      const answer = (text) => tgAnswerCallback(cq.id, text, false);
+
+      // 👇 이하 기존 코드 그대로 유지
+      ...
+     
     if (cq) {
       const data = cq.data || "";
       const from = cq.from;
