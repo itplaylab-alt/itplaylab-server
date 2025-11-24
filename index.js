@@ -1314,14 +1314,14 @@ app.post("/telegram/webhook", async (req, res) => {
   try {
     const body = req.body || {};
     const cq = body.callback_query || null;
-    const message = body.message || body.edited_message || cq?.message || {};
+    const message = body.message || body.edited_message || cq?.message || null;
 
     // --------------------------------------------------------------
     // Telegram → GAS 공용 로깅 (fire & forget)
     // --------------------------------------------------------------
     try {
-      const fromAll = cq?.from || message.from || {};
-      const chatForLog = message.chat || cq?.message?.chat || {};
+      const fromAll = cq?.from || message?.from || {};
+      const chatForLog = message?.chat || cq?.message?.chat || {};
 
       const chatIdForLog = chatForLog.id || TELEGRAM_ADMIN_CHAT_ID;
       const usernameForLog =
@@ -1329,7 +1329,7 @@ app.post("/telegram/webhook", async (req, res) => {
         [fromAll.first_name, fromAll.last_name].filter(Boolean).join(" ") ||
         "unknown";
 
-      const textForLog = (cq?.data || message.text || "").trim();
+      const textForLog = (cq?.data || message?.text || "").trim();
 
       logToSheet({
         chat_id: chatIdForLog,
@@ -1483,7 +1483,7 @@ app.post("/telegram/webhook", async (req, res) => {
           )
           .join(" → ");
 
-        const infoMsg = [
+        const msg = [
           fmtTitle(trace.title),
           fmtTrace(trace.id),
           `진행 기록: ${hist || "-"}`,
@@ -1492,7 +1492,7 @@ app.post("/telegram/webhook", async (req, res) => {
         ].join("\n");
 
         await answer("ℹ️ 상태 전송");
-        await tgSend(chatId, infoMsg, "HTML");
+        await tgSend(chatId, msg, "HTML");
 
         return res.json({ ok: true });
       }
@@ -1512,19 +1512,225 @@ app.post("/telegram/webhook", async (req, res) => {
     const chatId = message.chat.id;
     const text = message.text.trim();
 
-    // ... 이하 /approve, /reject, /status, /report, 자연어 처리, 에코 로직은
-    // 네가 보내준 그대로 두면 됨 (message 변수만 사용하도록 이미 맞춰져 있음)
-    // (지금 붙여둔 코드 그대로 아래는 건드리지 않아도 됨)
-
-    // ⬇️ 여기부터는 네 코드 그대로 유지
     // /approve, /승인
     if (text.startsWith("/approve") || text.startsWith("/승인")) {
-      // ...
-      // (이하 기존 코드 그대로)
+      const { trace_id, step } = parseTelegramCommand(text);
+      const checks = parseChecks(text);
+      const trace = trace_id && traces.get(trace_id);
+
+      if (!trace) {
+        await tgSend(
+          chatId,
+          `해당 작업을 찾을 수 없습니다.\n${fmtTrace(trace_id)}`
+        );
+        return res.json({ ok: true });
+      }
+
+      const expectedNext = getNextStep(trace);
+      if (step && expectedNext && step !== expectedNext) {
+        await tgSend(
+          chatId,
+          `예상 단계와 다릅니다. expected: ${expectedNext}`
+        );
+        return res.json({ ok: true });
+      }
+
+      if (trace.currentIndex + 1 < trace.steps.length) {
+        trace.currentIndex += 1;
+      }
+
+      const approvedBy = approverName(message.from);
+
+      await logToSheet({
+        type: "approval_approve",
+        input_text: trace.title,
+        output_text: { by: approvedBy, checks },
+        project: PROJECT,
+        category: "approval",
+        note: `trace=${trace.id}`,
+        trace_id: trace.id,
+        step: trace.steps[trace.currentIndex],
+        ok: true,
+      });
+
+      await runFromCurrent(trace);
+
+      const msg = [
+        fmtTitle(trace.title),
+        fmtTrace(trace.id),
+        `승인자: <b>${approvedBy}</b>`,
+        checks.length
+          ? `체크: ${checks.map((k) => labelOf(k)).join(", ")}`
+          : "체크: -",
+        `상태: <b>${trace.status}</b>`,
+      ].join("\n");
+
+      await tgSend(
+        chatId,
+        buildNotifyMessage({
+          type: "success",
+          title: "승인 처리됨",
+          message: msg,
+        })
+      );
+
+      return res.json({ ok: true });
     }
 
-    // (... 나머지 /reject, /status, /report, 자연어, 에코 부분은 그대로 ...)
-    // 마지막까지 동일
+    // /reject, /반려
+    if (text.startsWith("/reject") || text.startsWith("/반려")) {
+      const { trace_id, reason = "" } = parseTelegramCommand(text);
+      const checks = parseChecks(text);
+      const trace = trace_id && traces.get(trace_id);
+
+      if (!trace) {
+        await tgSend(
+          chatId,
+          `해당 작업을 찾을 수 없습니다.\n${fmtTrace(trace_id)}`
+        );
+        return res.json({ ok: true });
+      }
+
+      trace.status = "rejected";
+      trace.rejectReason = reason;
+
+      const rejectedBy = approverName(message.from);
+
+      await logToSheet({
+        type: "approval_reject",
+        input_text: trace.title,
+        output_text: { by: rejectedBy, reason, checks },
+        project: PROJECT,
+        category: "approval",
+        note: `trace=${trace.id}`,
+        trace_id: trace.id,
+        step: trace.steps[trace.currentIndex],
+        ok: false,
+        error: `REJECTED: ${reason}`,
+      });
+
+      const msg = [
+        fmtTitle(trace.title),
+        fmtTrace(trace.id),
+        `진행 상태: <b>반려</b>`,
+        `반려자: <b>${rejectedBy}</b>`,
+        `사유: <code>${reason || "-"}</code>`,
+        checks.length
+          ? `체크: ${checks.map((k) => labelOf(k)).join(", ")}`
+          : "체크: -",
+      ].join("\n");
+
+      await tgSend(
+        chatId,
+        buildNotifyMessage({
+          type: "error",
+          title: "반려 처리됨",
+          message: msg,
+        })
+      );
+
+      return res.json({ ok: true });
+    }
+
+    // /status, /상태
+    if (text.startsWith("/status") || text.startsWith("/상태")) {
+      const { trace_id } = parseTelegramCommand(text);
+      const trace = trace_id && traces.get(trace_id);
+
+      if (!trace) {
+        await tgSend(
+          chatId,
+          `해당 작업을 찾을 수 없습니다.\n${fmtTrace(trace_id)}`
+        );
+      } else {
+        const hist = trace.history
+          .map(
+            (h) =>
+              `${labelStep(h.step)}:${
+                h.ok ? "✅" : "❌"
+              }(${h.latency_ms ?? 0}ms/${h.provider || "-"})`
+          )
+          .join(" → ");
+
+        const msg = [
+          fmtTitle(trace.title),
+          fmtTrace(trace.id),
+          `진행 기록: ${hist || "-"}`,
+          `현재 위치: index ${trace.currentIndex}/${trace.steps.length}`,
+          `상태: <b>${trace.status}</b>`,
+        ].join("\n");
+
+        await tgSend(chatId, msg, "HTML");
+      }
+
+      return res.json({ ok: true });
+    }
+
+    // /report, /리포트
+    if (text.startsWith("/report") || text.startsWith("/리포트")) {
+      const { trace_id } = parseTelegramCommand(text);
+      const trace = trace_id && traces.get(trace_id);
+
+      if (!trace) {
+        await tgSend(
+          chatId,
+          `해당 작업을 찾을 수 없습니다.\n${fmtTrace(trace_id)}`
+        );
+        return res.json({ ok: true });
+      }
+
+      await tgSend(chatId, buildSummaryReport(trace), "HTML");
+      return res.json({ ok: true });
+    }
+
+    // 자연어 요청 (트레이스 생성)
+    if (!text.startsWith("/")) {
+      const { title, steps, profile } = parseFreeText(text);
+      const trace_id = genTraceId();
+      const trace = {
+        id: trace_id,
+        createdAt: nowISO(),
+        chatId,
+        title,
+        profile,
+        steps,
+        currentIndex: 0,
+        approvalMode: APPROVAL_MODE,
+        history: [],
+        lastOutput: {},
+        status: "initialized",
+        revisionCount: 0,
+      };
+
+      traces.set(trace_id, trace);
+
+      await tgSend(
+        chatId,
+        buildNotifyMessage({
+          type: "success",
+          title: "요청 접수",
+          message: `${fmtTrace(trace_id)}`,
+        })
+      );
+
+      try {
+        await runFromCurrent(trace);
+      } catch (err) {
+        console.error("[runFromCurrent] error:", err);
+      }
+
+      await logToSheet({
+        type: "telegram_text",
+        input_text: text,
+        output_text: { title, steps, profile, chatId },
+        project: PROJECT,
+        category: "chat",
+        note: `trace=${trace_id}`,
+        trace_id,
+      });
+
+      return res.json({ ok: true });
+    }
 
     // 기타: 단순 에코
     await tgSend(chatId, `당신이 보낸 메시지: ${text}`, "HTML");
@@ -1548,3 +1754,203 @@ app.post("/telegram/webhook", async (req, res) => {
     return res.sendStatus(500);
   }
 });
+
+/* 루트 웹훅(에코) */
+app.post("/", async (req, res) => {
+  try {
+    const message = req.body?.message;
+    if (!message || !message.text) return res.sendStatus(200);
+
+    const chatId = message.chat.id;
+    const text = message.text;
+
+    await tgSend(chatId, `당신이 보낸 메시지: ${text}`, "HTML");
+    await logToSheet({
+      chat_id: chatId,
+      username: message.from?.username || "",
+      type: "telegram_text",
+      input_text: text,
+      output_text: `당신이 보낸 메시지: ${text}`,
+      project: PROJECT,
+      category: "chat",
+      note: "root webhook",
+    });
+
+    res.sendStatus(200);
+  } catch (e) {
+    console.error("❌ webhook error:", e?.message);
+    if (shouldNotify("error")) {
+      try {
+        await tgSend(
+          TELEGRAM_ADMIN_CHAT_ID,
+          buildNotifyMessage({
+            type: "error",
+            title: "Webhook 처리 오류",
+            message: e?.message || "unknown",
+          })
+        );
+      } catch {}
+    }
+    res.sendStatus(500);
+  }
+});
+
+// Google Apps Script 연결 테스트
+app.get("/test-gas", async (req, res) => {
+  try {
+    const resp = await fetch(process.env.GAS_INGEST_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        token: process.env.INGEST_TOKEN,
+        contents: {
+          type: "test_log",
+          message: "hello_from_render_test",
+        },
+      }),
+    });
+
+    const text = await resp.text();
+    return res.send(`GAS Response: ${text}`);
+  } catch (e) {
+    console.error("GAS ERROR:", e);
+    return res.status(500).send("GAS ERROR");
+  }
+});
+
+// ⚠️ 필요하면 환경변수로 dev 여부 제어
+const IS_DEV = true;
+
+/**
+ * DEV 1) video_status 업데이트 테스트
+ * GET /dev/test-video-status?trace_id=trc_xxxx&status=video_generating
+ */
+if (IS_DEV) {
+  app.get("/dev/test-video-status", async (req, res) => {
+    const traceId = req.query.trace_id;
+    const status = req.query.status || "video_generating";
+
+    if (!traceId) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "trace_id query param required" });
+    }
+
+    try {
+      const result = await updateVideoStatus(traceId, status);
+      return res.json({ ok: true, traceId, status, result });
+    } catch (err) {
+      console.error("GET /dev/test-video-status error:", err);
+      return res
+        .status(500)
+        .json({ ok: false, error: err.message || "internal_error" });
+    }
+  });
+
+  /**
+   * DEV 2) video-factory callback 직접 호출 테스트 (성공)
+   * POST /dev/test-callback-done
+   * body: { trace_id, video_url?, thumbnail_url?, duration? }
+   */
+  app.post("/dev/test-callback-done", async (req, res) => {
+    const {
+      trace_id: traceId,
+      video_url,
+      thumbnail_url,
+      duration,
+    } = req.body || {};
+
+    if (!traceId) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "trace_id required in body" });
+    }
+
+    try {
+      await updateVideoStatus(traceId, "video_done", {
+        video_url,
+        video_thumbnail_url: thumbnail_url,
+        video_duration_sec: duration,
+      });
+
+      await updateVideoStatus(traceId, "upload_pending");
+
+      return res.json({
+        ok: true,
+        traceId,
+        status: "video_done → upload_pending",
+      });
+    } catch (err) {
+      console.error("POST /dev/test-callback-done error:", err);
+      return res
+        .status(500)
+        .json({ ok: false, error: err.message || "internal_error" });
+    }
+  });
+
+  /**
+   * DEV 3) video-factory callback 직접 호출 테스트 (실패)
+   * POST /dev/test-callback-failed
+   * body: { trace_id, error_message? }
+   */
+  app.post("/dev/test-callback-failed", async (req, res) => {
+    const { trace_id: traceId, error_message } = req.body || {};
+
+    if (!traceId) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "trace_id required in body" });
+    }
+
+    try {
+      await updateVideoStatus(traceId, "video_failed", {
+        video_error_message:
+          error_message || "mock error from dev route",
+      });
+
+      return res.json({
+        ok: true,
+        traceId,
+        status: "video_failed",
+      });
+    } catch (err) {
+      console.error("POST /dev/test-callback-failed error:", err);
+      return res
+        .status(500)
+        .json({ ok: false, error: err.message || "internal_error" });
+    }
+  });
+
+  /**
+   * DEV 4) startVideoGeneration 단독 테스트
+   * GET /dev/test-start-video?trace_id=trc_xxxx
+   */
+  app.get("/dev/test-start-video", async (req, res) => {
+    const traceId = req.query.trace_id;
+
+    if (!traceId) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "trace_id query param required" });
+    }
+
+    try {
+      await startVideoGeneration(traceId);
+      return res.json({ ok: true, traceId });
+    } catch (err) {
+      console.error("GET /dev/test-start-video error:", err);
+      return res
+        .status(500)
+        .json({ ok: false, error: err.message || "internal_error" });
+    }
+  });
+}
+
+const PORT = process.env.PORT || 10000;
+
+app.listen(PORT, () => {
+  console.log(
+    `🚀 Server is running on port ${PORT} (approval_mode=${APPROVAL_MODE})`
+  );
+});
+
