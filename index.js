@@ -9,7 +9,12 @@ import axios from "axios";
 import crypto from "crypto";
 import OpenAI from "openai";
 import { callLiteGPT } from "./liteClient.js";
-import { findByTraceId, updateVideoStatus } from "./src/jobRepo.js";
+import {
+  findByTraceId,
+  updateVideoStatus,
+  createJobFromPlanQueueRow, // ✅ 추가
+} from "./src/jobRepo.js";
+
 import { startVideoGeneration } from "./src/videoFactoryClient.js";
 
 const app = express();
