@@ -45,25 +45,28 @@ app.get("/healthcheck", (req, res) => {
     },
   });
 });
-// ✅ AutoPilot v1 - PlanQueue 실데이터 수신 + JobRow 생성
+// ✅ AutoPilot v1 – PlanQueue 실데이터 수신 + JobRow 생성
 app.post("/autopilot/planqueue", async (req, res) => {
   try {
     const body = req.body || {};
     const { secret, payload } = body;
 
-    // 1) 인증키 확인 (GAS AUTOPILOT_API_KEY 와 동일해야 함)
+    // 1) 인증키 확인
     if (!secret || secret !== process.env.AUTOPILOT_API_KEY) {
       console.warn("[AUTOPILOT][PLANQUEUE] ❌ invalid secret");
-      return res.status(401).json({ ok: false, error: "invalid_secret" });
+      return res.status(401).json({
+        ok: false,
+        error: "invalid_secret",
+      });
     }
 
-    // 2) 들어온 payload 로그
+    // 2) payload 로그
     console.log(
       "[AUTOPILOT][PLANQUEUE] ✅ received:",
       JSON.stringify(payload, null, 2)
     );
 
-    // 2-1) PlanQueue row 기반으로 JobRow 생성 요청
+    // 2-1) PlanQueue row 기반 JobRow 생성
     const job = await createJobFromPlanQueueRow(payload);
 
     if (!job) {
@@ -76,26 +79,21 @@ app.post("/autopilot/planqueue", async (req, res) => {
 
     console.log("[AUTOPILOT][PLANQUEUE] ✅ JobRow created:", job);
 
-    // 3) 생성된 Job 정보까지 응답
+    // 3) 생성된 Job 정보 응답
     return res.status(200).json({
       ok: true,
-      received: {
-        type: payload?.type,
-        row_index: payload?.row_index,
-      },
       job,
     });
   } catch (err) {
     console.error("[AUTOPILOT][PLANQUEUE] ❌ error:", err);
-    return res.status(500).json({ ok: false, error: err.message });
+    return res.status(500).json({
+      ok: false,
+      error: "server_error",
+      detail: err.message,
+    });
   }
-});
+}); // ← 여기 딱 한 번만 있어야 함
 
-  } catch (err) {
-    console.error("[AUTOPILOT][PLANQUEUE] ❌ error:", err);
-    return res.status(500).json({ ok: false, error: err.message });
-  }
-});
 
 app.use((err, req, res, next) => {
   if (err?.type === "entity.parse.failed" || err instanceof SyntaxError) {
