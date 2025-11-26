@@ -38,12 +38,12 @@ export async function findByTraceId(traceId) {
 }
 
 /* ============================================================================
- * 생성 (✅ 이번에 새로 연결되는 핵심)
+ * 생성 (✅ PlanQueue → JobRow 생성)
  * ========================================================================== */
 
 /**
  * PlanQueue row 기반으로 Job 생성
- * @param {object} payload
+ * @param {object} payload  // { row_index, row: { trace_id, job_type, input, created_at, ... } }
  * @returns {object|null}
  */
 export async function createJobFromPlanQueueRow(payload = {}) {
@@ -52,7 +52,9 @@ export async function createJobFromPlanQueueRow(payload = {}) {
       action: "create",
       source: "autopilot_v1",
       row_index: payload.row_index,
-      row: payload.row, // { trace_id, job_type, input, created_at ... }
+      row: payload.row,           // { trace_id, job_type, input, created_at ... }
+      // ✅ 기본 status 지정 (GAS에서 없으면 plan_pending 으로 시작)
+      default_status: payload.default_status || "plan_pending",
     };
 
     const res = await axios.post(GAS_WEB_URL, body, {
