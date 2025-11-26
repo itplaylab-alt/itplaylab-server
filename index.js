@@ -1948,6 +1948,94 @@ if (IS_DEV) {
 
 const PORT = process.env.PORT || 10000;
 
+/* ─────────────────────────────────────────────
+   AutoPilot v1 — Plan → Produce 단일 루프
+───────────────────────────────────────────── */
+
+const GAS_AUTOPILOT_URL = process.env.GAS_AUTOPILOT_URL;
+const AUTOPILOT_API_KEY = process.env.AUTOPILOT_API_KEY;
+
+// GAS 호출 헬퍼
+async function callAutopilotGAS(action, payload = {}) {
+  const res = await axios.post(GAS_AUTOPILOT_URL, {
+    action,
+    api_key: AUTOPILOT_API_KEY,
+    ...payload,
+  });
+  return res.data;
+}
+
+// topic → 테스트용 콘텐츠 생성
+async function autopilotProduce(topic) {
+  const prompt = `주제: ${topic}
+한 문단짜리 아주 짧은 테스트 스크립트를 작성해줘.`;
+
+  const openai = new OpenAI({
+    apiKey: OPENAI_API_KEY,
+  });
+
+  const r = await openai.chat.completions.create({
+    model: OPENAI_MODEL_RESP,
+    messages: [
+      { role: "system", content: "테스트용 콘텐츠 생성기" },
+      { role: "user", content: prompt },
+    ],
+    max_tokens: 200,
+  });
+
+  return r.choices?.[0]?.message?.content || "";
+}
+
+// AutoPilot 실행 라우트
+app.post("/autopilot/run", async (req, res) => {
+  console.log("[AutoPilot] run");
+
+  try {
+    const plan = await callAutopilotGAS("getNextPlan");
+
+    if (!plan || !plan.plan_id) {
+      return res.json({
+        ok: true,
+        message: "no pending plan",
+      });
+    }
+
+    await callAutopilotGAS("updatePlanStatus", {
+      plan_id: plan.plan_id,
+      status: "processing",
+    });
+
+    const result = await autopilotProduce(plan.topic);
+
+    await callAutopilotGAS("logProduction", {
+      plan_id: plan.plan_id,
+      result,
+    });
+
+    await callAutopilotGAS("incrementKPI", {
+      date: new Date().toISOString().slice(0, 10),
+      field: "produced",
+      amount: 1,
+    });
+
+    await callAutopilotGAS("updatePlanStatus", {
+      plan_id: plan.plan_id,
+      status: "done",
+    });
+
+    res.json({
+      ok: true,
+      plan_id: plan.plan_id,
+    });
+  } catch (e) {
+    console.error("[AutoPilot ERROR]", e);
+    res.status(500).json({
+      ok: false,
+      error: e.message,
+    });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(
     `🚀 Server is running on port ${PORT} (approval_mode=${APPROVAL_MODE})`
