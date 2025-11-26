@@ -45,7 +45,7 @@ app.get("/healthcheck", (req, res) => {
     },
   });
 });
-// ✅ AutoPilot v1 – PlanQueue 실데이터 수신
+// ✅ AutoPilot v1 - PlanQueue 실데이터 수신 + JobRow 생성
 app.post("/autopilot/planqueue", async (req, res) => {
   try {
     const body = req.body || {};
@@ -57,20 +57,40 @@ app.post("/autopilot/planqueue", async (req, res) => {
       return res.status(401).json({ ok: false, error: "invalid_secret" });
     }
 
-    // 2) payload 구조 로깅 (나중에 여기서 jobRepo 연동 가능)
+    // 2) 들어온 payload 로그
     console.log(
       "[AUTOPILOT][PLANQUEUE] ✅ received:",
       JSON.stringify(payload, null, 2)
     );
 
-    // 3) 일단은 단순 확인용 응답
+    // 2-1) PlanQueue row 기반으로 JobRow 생성 요청
+    const job = await createJobFromPlanQueueRow(payload);
+
+    if (!job) {
+      console.warn("[AUTOPILOT][PLANQUEUE] ❌ job create 실패");
+      return res.status(500).json({
+        ok: false,
+        error: "job_create_failed",
+      });
+    }
+
+    console.log("[AUTOPILOT][PLANQUEUE] ✅ JobRow created:", job);
+
+    // 3) 생성된 Job 정보까지 응답
     return res.status(200).json({
       ok: true,
       received: {
         type: payload?.type,
         row_index: payload?.row_index,
       },
+      job,
     });
+  } catch (err) {
+    console.error("[AUTOPILOT][PLANQUEUE] ❌ error:", err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
   } catch (err) {
     console.error("[AUTOPILOT][PLANQUEUE] ❌ error:", err);
     return res.status(500).json({ ok: false, error: err.message });
