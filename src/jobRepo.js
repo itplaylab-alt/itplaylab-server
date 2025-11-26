@@ -1,23 +1,26 @@
-// jobRepo.js
+// src/jobRepo.js
 // Google Apps Script Web App(GAS_WEB_URL)과 통신해서
-// CONTENT_LOG 시트의 JobRow를 조회/업데이트하는 레포지토리
+// CONTENT_LOG / PlanQueue 기반 JobRow를 조회·생성·업데이트하는 레포지토리
 
 import axios from "axios";
 
-const GAS_WEB_URL = process.env.GAS_INGEST_URL; 
+const GAS_WEB_URL = process.env.GAS_INGEST_URL;
 // 예: https://script.google.com/macros/s/xxxx/exec
 
 if (!GAS_WEB_URL) {
-  console.warn("[jobRepo] GAS_INGEST_URL 환경변수가 없습니다!");
+  console.warn("[jobRepo] ⚠️ GAS_INGEST_URL 환경변수가 없습니다!");
 }
 
+/* ============================================================================
+ * 조회
+ * ========================================================================== */
+
 /**
- * 특정 trace_id로 JobRow를 조회
+ * 특정 trace_id로 JobRow 조회
  * @param {string} traceId
  * @returns {object|null}
  */
 export async function findByTraceId(traceId) {
-
   try {
     const url = `${GAS_WEB_URL}?action=jobByTraceId&trace_id=${traceId}`;
     const res = await axios.get(url);
@@ -34,6 +37,48 @@ export async function findByTraceId(traceId) {
   }
 }
 
+/* ============================================================================
+ * 생성 (✅ 이번에 새로 연결되는 핵심)
+ * ========================================================================== */
+
+/**
+ * PlanQueue row 기반으로 Job 생성
+ * @param {object} payload
+ * @returns {object|null}
+ */
+export async function createJobFromPlanQueueRow(payload = {}) {
+  try {
+    const body = {
+      action: "create",
+      source: "autopilot_v1",
+      row_index: payload.row_index,
+      row: payload.row, // { trace_id, job_type, input, created_at ... }
+    };
+
+    const res = await axios.post(GAS_WEB_URL, body, {
+      headers: { "Content-Type": "application/json" },
+    });
+
+    if (!res.data || !res.data.ok) {
+      console.log("[jobRepo] createJob 실패:", res.data);
+      return null;
+    }
+
+    console.log(
+      "[jobRepo][CREATE] ✅ Job 생성 완료:",
+      res.data.job || body
+    );
+
+    return res.data.job || body;
+  } catch (err) {
+    console.error("[jobRepo] createJob 오류:", err.message);
+    return null;
+  }
+}
+
+/* ============================================================================
+ * 업데이트
+ * ========================================================================== */
 
 /**
  * JobRow의 status / step / checks 등을 업데이트
