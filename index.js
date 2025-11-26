@@ -26,6 +26,21 @@ app.use((req, res, next) => {
   next();
 });
 app.use(express.json({ limit: "1mb", type: ["application/json"] }));
+// ✅ Healthcheck (Render / PowerShell 확인용)
+app.get("/healthcheck", (req, res) => {
+  res.status(200).json({
+    ok: true,
+    service: "itplaylab-server",
+    ts: new Date().toISOString(),
+    env: {
+      approval_mode: process.env.APPROVAL_MODE || null,
+      autopilot_env: process.env.AUTOPILOT_ENV || null,
+      has_sheet_id: !!process.env.AUTOPILOT_SHEET_ID,
+      has_gas_url: !!process.env.GAS_AUTOPILOT_URL,
+    },
+  });
+});
+
 app.use((err, req, res, next) => {
   if (err?.type === "entity.parse.failed" || err instanceof SyntaxError) {
     console.error("❌ JSON parse error:", err.message);
