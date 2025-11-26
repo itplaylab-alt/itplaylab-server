@@ -40,6 +40,37 @@ app.get("/healthcheck", (req, res) => {
     },
   });
 });
+// ✅ AutoPilot v1 – PlanQueue 실데이터 수신
+app.post("/autopilot/planqueue", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const { secret, payload } = body;
+
+    // 1) 인증키 확인 (GAS AUTOPILOT_API_KEY 와 동일해야 함)
+    if (!secret || secret !== process.env.AUTOPILOT_API_KEY) {
+      console.warn("[AUTOPILOT][PLANQUEUE] ❌ invalid secret");
+      return res.status(401).json({ ok: false, error: "invalid_secret" });
+    }
+
+    // 2) payload 구조 로깅 (나중에 여기서 jobRepo 연동 가능)
+    console.log(
+      "[AUTOPILOT][PLANQUEUE] ✅ received:",
+      JSON.stringify(payload, null, 2)
+    );
+
+    // 3) 일단은 단순 확인용 응답
+    return res.status(200).json({
+      ok: true,
+      received: {
+        type: payload?.type,
+        row_index: payload?.row_index,
+      },
+    });
+  } catch (err) {
+    console.error("[AUTOPILOT][PLANQUEUE] ❌ error:", err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
 
 app.use((err, req, res, next) => {
   if (err?.type === "entity.parse.failed" || err instanceof SyntaxError) {
