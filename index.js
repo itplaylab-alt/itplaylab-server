@@ -555,10 +555,52 @@ async function handleNextJob(req, res) {
     });
   }
 }
+async function handleJobStatusUpdate(req, res) {
+  try {
+    const jobId = req.params.id;
+    const { status, worker_id, latency_ms, error_message } = req.body;
+
+    if (!["DONE", "FAILED"].includes(status)) {
+      return res.status(400).json({ error: "Invalid status" });
+    }
+
+    const nowIso = new Date().toISOString();
+
+    const { data, error } = await supabase
+      .from("job_queue")
+      .update({
+        status,
+        worker_id,
+        latency_ms,
+        error_message,
+        finished_at: nowIso,
+        updated_at: nowIso,
+      })
+      .eq("id", jobId)
+      .select()
+      .maybeSingle();
+
+    if (error) {
+      console.error("❌ job update error:", error);
+      return res.status(500).json({ error: "update_failed", detail: error });
+    }
+
+    return res.json({ ok: true, job: data });
+  } catch (err) {
+    console.error("❌ /job/:id/status error:", err);
+    return res.status(500).json({ error: "server_error" });
+  }
+}
 
 app.post("/next-job", handleNextJob);
 app.get("/next-job", handleNextJob);
-
+// /job/:id/status
+app.post(
+  "/job/:id/status",
+  requireJobQueueSecret,
+  express.json(),
+  handleJobStatusUpdate
+);
 /* 대시보드 */
 const traces = new Map();
 function getTraceSnapshot(t) {
