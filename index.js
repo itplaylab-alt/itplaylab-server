@@ -613,14 +613,7 @@ app.post(
   }
 );
 
-    return res.json({
-      ok: true,
-      id: req.params.id,
-      body: req.body,
-    });
-  }
-);
-
+  
 /* 대시보드 */
 const traces = new Map();
 function getTraceSnapshot(t) {
