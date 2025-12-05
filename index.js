@@ -597,9 +597,20 @@ app.get("/next-job", handleNextJob);
 // /job/:id/status
 app.post(
   "/job/:id/status",
-  requireJobQueueSecret,
+  requireJobQueueSecret,   // 일단 그대로 둬서 시크릿까지 같이 검증
   express.json(),
-  handleJobStatusUpdate
+  (req, res) => {
+    console.log("✅ /job/:id/status HIT", {
+      id: req.params.id,
+      body: req.body,
+    });
+
+    return res.json({
+      ok: true,
+      id: req.params.id,
+      body: req.body,
+    });
+  }
 );
 /* 대시보드 */
 const traces = new Map();
