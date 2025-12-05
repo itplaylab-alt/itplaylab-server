@@ -21,7 +21,6 @@ const supabaseRest =
         },
       })
     : null;
-
 import crypto from "crypto";
 import OpenAI from "openai";
 import { callLiteGPT } from "./liteClient.js";
@@ -34,7 +33,41 @@ import {
 } from "./src/jobRepo.js";
 
 import { startVideoGeneration } from "./src/videoFactoryClient.js";
+// Supabase job_queue에서 PENDING 하나 꺼내 RUNNING 으로 잠그기
+async function popNextJobFromSupabase() {
+  if (!supabaseRest) {
+    throw new Error("supabase_not_configured");
+  }
 
+  // 1) 가장 오래된 PENDING job 1개 조회
+  const { data: jobs } = await supabaseRest.get("/job_queue", {
+    params: {
+      select: "*",
+      status: "eq.PENDING",
+      order: "created_at.asc",
+      limit: 1,
+    },
+  });
+
+  // 대기 중인 job 이 없으면 null
+  if (!jobs || jobs.length === 0) {
+    return null;
+  }
+
+  const job = jobs[0];
+
+  // 2) RUNNING 으로 잠그기 (locked_at / locked_by 세팅)
+  const updates = {
+    status: "RUNNING",
+    locked_at: new Date().toISOString(),
+    locked_by: "server", // 필요하면 나중에 worker 이름으로 변경
+  };
+
+  await supabaseRest.patch(`/job_queue?id=eq.${job.id}`, updates);
+
+  // 갱신된 필드까지 합쳐서 리턴
+  return { ...job, ...updates };
+}
 const app = express();
 
 /* ────────────────────────────────────────────────────────────
@@ -477,21 +510,27 @@ function extractWorkerMeta(req) {
   };
 }
 
+// Supabase 기반 next-job 핸들러
 async function handleNextJob(req, res) {
   try {
-    if (!isJobqueueAuthOk(req)) {
+    // 1) worker 인증 (선택)
+    const expected = process.env.JOBQUEUE_WORKER_SECRET;
+    const provided =
+      req.headers["x-jobqueue-secret"] ||
+      req.headers["x-api-key"] ||
+      (req.query && req.query.secret);
+
+    if (expected && expected !== provided) {
       return res.status(401).json({
         ok: false,
-        error: "invalid_jobqueue_secret",
+        error: "unauthorized_worker",
       });
     }
 
-    const workerMeta = extractWorkerMeta(req);
-    const t0 = Date.now();
+    // 2) Supabase에서 PENDING job 하나 꺼내오기
+    const job = await popNextJobFromSupabase();
 
-    // ✅ jobRepo에서 실제 "다음 Job 1건"을 pop 해오는 부분
-    const job = await popNextJobForWorker(workerMeta);
-
+    // 3) 대기 중인 job 없으면 no_pending_job 반환
     if (!job) {
       return res.json({
         ok: true,
@@ -501,22 +540,21 @@ async function handleNextJob(req, res) {
       });
     }
 
-    await logToSheet({
-      type: "jobqueue_next_job",
-      input_text: job.title || job.job_id || "",
-      output_text: {
-        job_id: job.id || job.job_id,
-        status: job.status || job.job_status || "",
-        workerMeta,
-      },
-      project: PROJECT,
-      category: "jobqueue",
-      note: "dispatch_to_worker",
-      latency_ms: Date.now() - t0,
-      trace_id: job.trace_id || "",
-      step: job.step || "",
+    // 4) job 하나 성공적으로 할당
+    return res.json({
       ok: true,
+      has_job: true,
+      job,
     });
+  } catch (err) {
+    console.error("❌ /next-job error:", err?.message || err);
+    return res.status(500).json({
+      ok: false,
+      error: err?.message || String(err),
+    });
+  }
+}
+
 
     return res.json({
       ok: true,
