@@ -598,21 +598,10 @@ app.get("/next-job", handleNextJob);
 // /job/:id/status
 app.post(
   "/job/:id/status",
+  requireJobQueueSecret,
   express.json(),
-  (req, res) => {
-    console.log("✅ /job/:id/status HIT", {
-      id: req.params.id,
-      body: req.body,
-    });
-
-    return res.json({
-      ok: true,
-      id: req.params.id,
-      body: req.body,
-    });
-  }
+  handleJobStatusUpdate
 );
-
   
 /* 대시보드 */
 const traces = new Map();
