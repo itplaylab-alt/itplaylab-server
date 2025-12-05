@@ -2196,6 +2196,25 @@ app.post("/autopilot/run", async (req, res) => {
     });
   }
 });
+// 3-x) JobQueue Worker용 next-job 엔드포인트 (임시 버전)
+app.get("/next-job", (req, res) => {
+  const expected = process.env.JOBQUEUE_WORKER_SECRET;
+  const provided = req.headers["x-jobqueue-secret"];
+
+  if (expected && provided !== expected) {
+    return res.status(401).json({
+      ok: false,
+      error: "unauthorized_worker",
+    });
+  }
+
+  return res.json({
+    ok: true,
+    has_job: false,
+    job: null,
+    message: "no_pending_job",
+  });
+});
 
 app.listen(PORT, () => {
   console.log(
