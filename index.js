@@ -12,7 +12,9 @@ import { callLiteGPT } from "./liteClient.js";
 import {
   findByTraceId,
   updateVideoStatus,
-  createJobFromPlanQueueRow, // ✅ 추가
+  createJobFromPlanQueueRow,
+  // ✅ worker가 가져갈 다음 Job 1건 pop
+  popNextJobForWorker,
 } from "./src/jobRepo.js";
 
 import { startVideoGeneration } from "./src/videoFactoryClient.js";
@@ -31,6 +33,7 @@ app.use((req, res, next) => {
   next();
 });
 app.use(express.json({ limit: "1mb", type: ["application/json"] }));
+
 // ✅ Healthcheck (Render / PowerShell 확인용)
 app.get("/healthcheck", (req, res) => {
   res.status(200).json({
@@ -45,6 +48,7 @@ app.get("/healthcheck", (req, res) => {
     },
   });
 });
+
 // ✅ AutoPilot v1 – PlanQueue 실데이터 수신 + JobRow 생성
 app.post("/autopilot/planqueue", async (req, res) => {
   try {
@@ -92,8 +96,7 @@ app.post("/autopilot/planqueue", async (req, res) => {
       detail: err.message,
     });
   }
-}); // ← 여기 딱 한 번만 있어야 함
-
+});
 
 app.use((err, req, res, next) => {
   if (err?.type === "entity.parse.failed" || err instanceof SyntaxError) {
@@ -129,6 +132,8 @@ const {
   SERVICE_NAME = "render-bot",
   APPROVAL_MODE: APPROVAL_MODE_RAW = "true",
   MAX_REVISIONS: MAX_REVISIONS_RAW = "3",
+  // ✅ worker 전용 인증키(있으면 사용, 없으면 프리)
+  JOBQUEUE_WORKER_SECRET = "",
 } = process.env;
 
 const APPROVAL_MODE = String(APPROVAL_MODE_RAW).toLowerCase() === "true";
@@ -286,6 +291,7 @@ async function tgAnswerCallback(id, text = "", show_alert = false) {
     console.error("Telegram answerCallbackQuery error:", e?.message);
   }
 }
+
 // === VIDEO_STATIC_START ===
 // 🔥 v0.1: /videos 정적 파일 제공
 import path from "path";
@@ -422,6 +428,98 @@ app.post("/job/update-video", async (req, res) => {
   }
 });
 
+/* 3-2) Worker용 JobQueue 라우트: /next-job
+   - Render Background Worker가 폴링하는 엔드포인트
+   - POST/GET 둘 다 지원
+   - jobRepo.popNextJobForWorker를 통해 '대기중인 Job 1건'을 pop + 잠금
+*/
+
+function isJobqueueAuthOk(req) {
+  // env에 JOBQUEUE_WORKER_SECRET이 없으면 인증 스킵
+  if (!JOBQUEUE_WORKER_SECRET) return true;
+  const key =
+    req.headers["x-jobqueue-secret"] ||
+    req.headers["x-api-key"] ||
+    req.query?.secret ||
+    req.body?.secret;
+  return key && key === JOBQUEUE_WORKER_SECRET;
+}
+
+function extractWorkerMeta(req) {
+  const workerId =
+    req.body?.worker_id ||
+    req.headers["x-worker-id"] ||
+    req.headers["x-render-worker-id"] ||
+    "anonymous_worker";
+  const workerType =
+    req.body?.worker_type || req.headers["x-worker-type"] || "render_worker";
+  const hostname = req.headers["x-render-compute-hostname"] || "";
+  return {
+    worker_id: String(workerId),
+    worker_type: String(workerType),
+    hostname: String(hostname),
+  };
+}
+
+async function handleNextJob(req, res) {
+  try {
+    if (!isJobqueueAuthOk(req)) {
+      return res.status(401).json({
+        ok: false,
+        error: "invalid_jobqueue_secret",
+      });
+    }
+
+    const workerMeta = extractWorkerMeta(req);
+    const t0 = Date.now();
+
+    // ✅ jobRepo에서 실제 "다음 Job 1건"을 pop 해오는 부분
+    const job = await popNextJobForWorker(workerMeta);
+
+    if (!job) {
+      return res.json({
+        ok: true,
+        has_job: false,
+        job: null,
+        message: "no_pending_job",
+      });
+    }
+
+    await logToSheet({
+      type: "jobqueue_next_job",
+      input_text: job.title || job.job_id || "",
+      output_text: {
+        job_id: job.id || job.job_id,
+        status: job.status || job.job_status || "",
+        workerMeta,
+      },
+      project: PROJECT,
+      category: "jobqueue",
+      note: "dispatch_to_worker",
+      latency_ms: Date.now() - t0,
+      trace_id: job.trace_id || "",
+      step: job.step || "",
+      ok: true,
+    });
+
+    return res.json({
+      ok: true,
+      has_job: true,
+      job,
+    });
+  } catch (err) {
+    console.error("❌ /next-job error:", err?.message || err);
+    return res.status(500).json({
+      ok: false,
+      error: "next_job_failed",
+      detail: err?.message || String(err),
+    });
+  }
+}
+
+app.post("/next-job", handleNextJob);
+app.get("/next-job", handleNextJob);
+
 /* 대시보드 */
 const traces = new Map();
 function getTraceSnapshot(t) {
@@ -468,7 +566,6 @@ app.get("/dashboard/active", (req, res) => {
 
 /* ────────────────────────────────────────────────────────────
    4) OpenAI 공용 호출자 (Responses → Fallback)
-   ※ 여기서 Responses API 호출 방식을 최신 형식으로 수정
 ──────────────────────────────────────────────────────────── */
 async function callOpenAIJson({
   system,
@@ -482,7 +579,6 @@ async function callOpenAIJson({
   let parsed = null;
 
   try {
-    // ✅ 최신 Responses API 형식 (response_format 대신 response.format)
     const resp = await oa.responses.create({
       model: OPENAI_MODEL || OPENAI_MODEL_RESP,
       input: [
@@ -504,7 +600,7 @@ async function callOpenAIJson({
       "";
     parsed = txt ? JSON.parse(txt) : null;
   } catch (e) {
-    // Fallback: Chat Completions (여긴 response_format 그대로 사용 가능)
+    // Fallback: Chat Completions
     provider = "chat.completions";
     try {
       const schemaHint = `다음 JSON 스키마에 맞춰 정확히 JSON만 출력하세요. 추가 설명 금지.\n${JSON.stringify(
@@ -649,7 +745,7 @@ async function aiAssets({ brief_id, script }) {
 }
 
 /* ────────────────────────────────────────────────────────────
-   4-1) LITE AI 작업자 (패턴 기반, gpt-4o-mini + LITE_SYSTEM_PROMPT)
+   4-1) LITE AI 작업자
 ──────────────────────────────────────────────────────────── */
 async function aiBriefLite(idea, meta = {}) {
   const r = await callLiteGPT("brief", idea, {
@@ -659,7 +755,7 @@ async function aiBriefLite(idea, meta = {}) {
 
   return {
     ok: r.ok,
-    data: r.output, // LITE 브리프 결과(문자열 또는 JSON)
+    data: r.output,
     provider: r.debug?.engine || "gpt-4o-mini-lite",
     latency_ms: r.debug?.latency_ms ?? 0,
     raw: r,
@@ -674,7 +770,7 @@ async function aiScriptLite(brief, meta = {}) {
 
   return {
     ok: r.ok,
-    data: r.output, // LITE 스크립트 결과(문자열 또는 JSON)
+    data: r.output,
     provider: r.debug?.engine || "gpt-4o-mini-lite",
     latency_ms: r.debug?.latency_ms ?? 0,
     raw: r,
@@ -914,7 +1010,6 @@ async function runFromCurrent(trace) {
     }
   }
 }
-
 /* ────────────────────────────────────────────────────────────
    6) 파서
 ──────────────────────────────────────────────────────────── */
@@ -1161,7 +1256,6 @@ app.post("/content/pipeline", async (req, res) => {
       chatId = TELEGRAM_ADMIN_CHAT_ID,
     } = req.body || {};
 
-    // title이 없으면 idea_id를 제목으로 사용
     const finalTitle = title || idea_id;
     if (!finalTitle) {
       return res
@@ -1349,36 +1443,37 @@ function buildSummaryReport(trace) {
 // --------------------------------------------------------------
 // 테스트용 GAS 로깅 엔드포인트
 // --------------------------------------------------------------
-app.get('/test/gas-log', async (req, res) => {
+app.get("/test/gas-log", async (req, res) => {
   try {
     const result = await logToSheet({
-      chat_id: 'render_test_chat',
-      username: 'render_server',
-      type: 'render_test_v0_1',
-      input_text: 'hello_from_/test/gas-log',
+      chat_id: "render_test_chat",
+      username: "render_server",
+      type: "render_test_v0_1",
+      input_text: "hello_from_/test/gas-log",
       ts: new Date().toISOString(),
     });
 
     return res.status(result.ok ? 200 : 500).json({
-      from: 'render',
-      endpoint: '/test/gas-log',
+      from: "render",
+      endpoint: "/test/gas-log",
       gas_ingest_url: GAS_INGEST_URL,
       payload_example: {
-        chat_id: 'render_test_chat',
-        username: 'render_server',
-        type: 'render_test_v0_1',
-        input_text: 'hello_from_/test/gas-log',
+        chat_id: "render_test_chat",
+        username: "render_server",
+        type: "render_test_v0_1",
+        input_text: "hello_from_/test/gas-log",
       },
       result,
     });
   } catch (err) {
-    console.error('[GET /test/gas-log] error:', err);
+    console.error("[GET /test/gas-log] error:", err);
     return res.status(500).json({
       ok: false,
       error: err.message,
     });
   }
 });
+
 app.post("/telegram/webhook", async (req, res) => {
   try {
     const body = req.body || {};
@@ -1397,7 +1492,6 @@ app.post("/telegram/webhook", async (req, res) => {
         fromAll.username ||
         [fromAll.first_name, fromAll.last_name].filter(Boolean).join(" ") ||
         "unknown";
-
       const textForLog = (cq?.data || message?.text || "").trim();
 
       logToSheet({
@@ -1823,7 +1917,6 @@ app.post("/telegram/webhook", async (req, res) => {
     return res.sendStatus(500);
   }
 });
-
 /* 루트 웹훅(에코) */
 app.post("/", async (req, res) => {
   try {
@@ -1973,8 +2066,7 @@ if (IS_DEV) {
 
     try {
       await updateVideoStatus(traceId, "video_failed", {
-        video_error_message:
-          error_message || "mock error from dev route",
+        video_error_message: error_message || "mock error from dev route",
       });
 
       return res.json({
@@ -2110,4 +2202,3 @@ app.listen(PORT, () => {
     `🚀 Server is running on port ${PORT} (approval_mode=${APPROVAL_MODE})`
   );
 });
-
