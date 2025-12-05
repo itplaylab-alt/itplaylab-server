@@ -69,6 +69,7 @@ async function popNextJobFromSupabase() {
   return { ...job, ...updates };
 }
 const app = express();
+console.log("🚀 ItplayLab server booted - USING THIS index.js");
 
 /* ────────────────────────────────────────────────────────────
    0) 공통 미들웨어
@@ -597,13 +598,21 @@ app.get("/next-job", handleNextJob);
 // /job/:id/status
 app.post(
   "/job/:id/status",
-  requireJobQueueSecret,   // 일단 그대로 둬서 시크릿까지 같이 검증
+  requireJobQueueSecret,
   express.json(),
   (req, res) => {
     console.log("✅ /job/:id/status HIT", {
       id: req.params.id,
       body: req.body,
     });
+
+    return res.json({
+      ok: true,
+      id: req.params.id,
+      body: req.body,
+    });
+  }
+);
 
     return res.json({
       ok: true,
