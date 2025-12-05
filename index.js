@@ -530,7 +530,7 @@ async function handleNextJob(req, res) {
     // 2) Supabase에서 PENDING job 하나 꺼내오기
     const job = await popNextJobFromSupabase();
 
-    // 3) 대기 중인 job 없으면 no_pending_job 반환
+    // 3) 대기 job 없으면 no_pending_job 반환
     if (!job) {
       return res.json({
         ok: true,
@@ -541,21 +541,6 @@ async function handleNextJob(req, res) {
     }
 
     // 4) job 하나 성공적으로 할당
-    return res.json({
-      ok: true,
-      has_job: true,
-      job,
-    });
-  } catch (err) {
-    console.error("❌ /next-job error:", err?.message || err);
-    return res.status(500).json({
-      ok: false,
-      error: err?.message || String(err),
-    });
-  }
-}
-
-
     return res.json({
       ok: true,
       has_job: true,
