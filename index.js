@@ -184,6 +184,8 @@ const {
   MAX_REVISIONS: MAX_REVISIONS_RAW = "3",
   // ✅ worker 전용 인증키(있으면 사용, 없으면 프리)
   JOBQUEUE_WORKER_SECRET = "",
+  // ✅ 내부 시스템용 API Key (GAS/내부 호출용)
+  INTERNAL_API_KEY,
 } = process.env;
 
 const APPROVAL_MODE = String(APPROVAL_MODE_RAW).toLowerCase() === "true";
@@ -484,6 +486,38 @@ app.post("/job/update-video", async (req, res) => {
    - jobRepo.popNextJobForWorker를 통해 '대기중인 Job 1건'을 pop + 잠금
 */
 
+/** 🔐 Worker → Server 인증 */
+function requireJobQueueSecret(req, res, next) {
+  const secret =
+    req.headers["x-jobqueue-secret"] ||
+    req.headers["x-api-key"] ||
+    req.query?.secret ||
+    req.body?.secret;
+
+  if (JOBQUEUE_WORKER_SECRET && secret !== JOBQUEUE_WORKER_SECRET) {
+    return res.status(401).json({ ok: false, error: "UNAUTHORIZED_WORKER" });
+  }
+  next();
+}
+
+/** 🔐 내부 시스템(GAS/내부 호출) 전용 인증 */
+function requireInternalApiKey(req, res, next) {
+  const key =
+    req.headers["x-api-key"] ||
+    req.headers["x-internal-api-key"] ||
+    req.query?.api_key ||
+    req.body?.api_key;
+
+  if (!INTERNAL_API_KEY) return next(); // 개발 편의
+
+  if (!key || key !== INTERNAL_API_KEY) {
+    return res
+      .status(401)
+      .json({ ok: false, error: "UNAUTHORIZED_INTERNAL" });
+  }
+  next();
+}
+
 function isJobqueueAuthOk(req) {
   // env에 JOBQUEUE_WORKER_SECRET이 없으면 인증 스킵
   if (!JOBQUEUE_WORKER_SECRET) return true;
@@ -602,7 +636,62 @@ app.post(
   express.json(),
   handleJobStatusUpdate
 );
-  
+
+// /create-job — 내부 시스템(GAS/자동화)이 JobQueue에 작업을 넣는 엔드포인트
+app.post(
+  "/create-job",
+  requireInternalApiKey,
+  express.json(),
+  async (req, res) => {
+    try {
+      const { payload } = req.body || {};
+
+      if (!payload) {
+        return res.status(400).json({
+          ok: false,
+          error: "INVALID_REQUEST",
+          message: "payload is required",
+        });
+      }
+
+      const { data, error } = await supabase
+        .from("job_queue")
+        .insert({
+          status: "PENDING",
+          payload,
+        })
+        .select()
+        .maybeSingle();
+
+      if (error) {
+        console.error("[/create-job] DB ERROR:", error);
+        return res.status(500).json({
+          ok: false,
+          error: "DB_INSERT_FAILED",
+          detail: error,
+        });
+      }
+
+      console.log("[/create-job] CREATED JOB:", data);
+
+      return res.json({
+        ok: true,
+        job: {
+          id: data.id,
+          status: data.status,
+          created_at: data.created_at,
+        },
+      });
+    } catch (err) {
+      console.error("[/create-job] ERROR:", err);
+      return res.status(500).json({
+        ok: false,
+        error: "UNEXPECTED_SERVER_ERROR",
+      });
+    }
+  }
+);
+
 /* 대시보드 */
 const traces = new Map();
 function getTraceSnapshot(t) {
@@ -2278,25 +2367,6 @@ app.post("/autopilot/run", async (req, res) => {
       error: e.message,
     });
   }
-});
-// 3-x) JobQueue Worker용 next-job 엔드포인트 (임시 버전)
-app.get("/next-job", (req, res) => {
-  const expected = process.env.JOBQUEUE_WORKER_SECRET;
-  const provided = req.headers["x-jobqueue-secret"];
-
-  if (expected && provided !== expected) {
-    return res.status(401).json({
-      ok: false,
-      error: "unauthorized_worker",
-    });
-  }
-
-  return res.json({
-    ok: true,
-    has_job: false,
-    job: null,
-    message: "no_pending_job",
-  });
 });
 
 app.listen(PORT, () => {
