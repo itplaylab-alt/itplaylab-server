@@ -6,6 +6,7 @@ dotenv.config();
 
 import express from "express";
 import axios from "axios";
+import { createClient } from "@supabase/supabase-js";
 // Supabase REST 클라이언트 (job_queue 전용)
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
@@ -21,6 +22,14 @@ const supabaseRest =
         },
       })
     : null;
+
+const supabase =
+  SUPABASE_URL && SUPABASE_SERVICE_KEY
+    ? createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
+        auth: { persistSession: false },
+      })
+    : null;
+
 import crypto from "crypto";
 import OpenAI from "openai";
 import { callLiteGPT } from "./liteClient.js";
