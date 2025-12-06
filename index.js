@@ -7,6 +7,7 @@ dotenv.config();
 import express from "express";
 import axios from "axios";
 import { createClient } from "@supabase/supabase-js";
+
 // Supabase REST 클라이언트 (job_queue 전용)
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
@@ -37,11 +38,12 @@ import {
   findByTraceId,
   updateVideoStatus,
   createJobFromPlanQueueRow,
-  // ✅ worker가 가져갈 다음 Job 1건 pop
+  // ✅ worker가 가져갈 다음 Job 1건 pop (현재는 사용 안 함)
   popNextJobForWorker,
 } from "./src/jobRepo.js";
 
 import { startVideoGeneration } from "./src/videoFactoryClient.js";
+
 // Supabase job_queue에서 PENDING 하나 꺼내 RUNNING 으로 잠그기
 async function popNextJobFromSupabase() {
   if (!supabaseRest) {
@@ -77,6 +79,7 @@ async function popNextJobFromSupabase() {
   // 갱신된 필드까지 합쳐서 리턴
   return { ...job, ...updates };
 }
+
 const app = express();
 console.log("🚀 ItplayLab server booted - USING THIS index.js");
 
@@ -599,6 +602,7 @@ async function handleNextJob(req, res) {
     });
   }
 }
+
 async function handleJobStatusUpdate(req, res) {
   try {
     const jobId = req.params.id;
@@ -638,6 +642,7 @@ async function handleJobStatusUpdate(req, res) {
 
 app.post("/next-job", handleNextJob);
 app.get("/next-job", handleNextJob);
+
 // /job/:id/status
 app.post(
   "/job/:id/status",
