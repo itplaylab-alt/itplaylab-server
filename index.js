@@ -100,11 +100,17 @@ app.post("/tg-webhook", async (req, res) => {
 // ─────────────────────────────────────────
 app.post("/next-job", async (req, res) => {
   const secret = req.query.secret;
+  const expected = CONFIG.JOBQUEUE_WORKER_SECRET;
 
-  if (secret !== CONFIG.JOBQUEUE_WORKER_SECRET) {
+  console.log(
+    "[NEXT-JOB AUTH]",
+    "expected:", (expected || "").slice(0, 4), "len:", expected?.length,
+    "got:", (secret || "").slice(0, 4), "len:", (secret || "").length
+  );
+
+  if (!secret || secret !== expected) {
     return res.json({ ok: false, error: "UNAUTHORIZED_WORKER" });
   }
-
   try {
     // 대기 중 작업 가져오기
     const job = await findByTraceId(null, { getNext: true });
