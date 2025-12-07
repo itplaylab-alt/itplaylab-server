@@ -11,7 +11,7 @@ import crypto from "crypto";
 // ─────────────────────────────────────────
 //  공통 설정
 // ─────────────────────────────────────────
-import CONFIG from "./lib/config.js";
+import { CONFIG } from "./lib/config.js";
 
 // 서비스 계층
 import { logToSheet } from "./services/gasLogger.js";
