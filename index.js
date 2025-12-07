@@ -98,35 +98,54 @@ app.post("/tg-webhook", async (req, res) => {
 // ─────────────────────────────────────────
 // 2) Worker 전용 엔드포인트 (/next-job)
 // ─────────────────────────────────────────
+// 2) Worker 전용 엔드포인트 (/next-job)
 app.post("/next-job", async (req, res) => {
-  const secret = req.query.secret;
-  const expected = CONFIG.JOBQUEUE_WORKER_SECRET;
+  const secret = req.query.secret || "";
+  const expected = CONFIG.JOBQUEUE_WORKER_SECRET || "";
 
-  console.log(
-    "[NEXT-JOB AUTH]",
-    "expected:", (expected || "").slice(0, 4), "len:", expected?.length,
-    "got:", (secret || "").slice(0, 4), "len:", (secret || "").length
-  );
-
-  if (!secret || secret !== expected) {
-    return res.json({ ok: false, error: "UNAUTHORIZED_WORKER" });
+  // 1. 시크릿 검사
+  if (!expected || secret !== expected) {
+    console.error("[NEXT-JOB] ❌ UNAUTHORIZED_WORKER", {
+      expected: expected && expected.slice(0, 4),
+      got: secret && secret.slice(0, 4),
+    });
+    return res.status(403).json({ ok: false, error: "UNAUTHORIZED_WORKER" });
   }
+
   try {
-    // 대기 중 작업 가져오기
+    // 2. 다음 작업 하나 가져오기 (기존 로직 그대로 사용)
     const job = await findByTraceId(null, { getNext: true });
 
     if (!job) {
-      return res.json({ ok: true, has_job: false, job: null, message: "no_pending_job" });
+      // 2-1. 대기 중인 작업 없음
+      return res.json({
+        ok: true,
+        has_job: false,
+        job: null,
+        message: "no_pending_job",
+      });
     }
+
+    // 2-2. 작업이 있는 경우 → 워커에게 넘겨줄 최소 정보만 전달
+    const payload = {
+      id: job.id,
+      trace_id: job.trace_id,
+      type: job.type,
+      params: job.params,
+    };
 
     return res.json({
       ok: true,
       has_job: true,
-      job,
+      job: payload,
+      message: "job_acquired",
     });
   } catch (e) {
-    console.error("next-job error:", e);
-    res.json({ ok: false, error: e.message });
+    console.error("[NEXT-JOB] 🧨 error:", e);
+    return res.status(500).json({
+      ok: false,
+      error: e?.message || "INTERNAL_ERROR",
+    });
   }
 });
 
