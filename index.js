@@ -122,7 +122,20 @@ async function ensureAjv() {
 const app = express();
 console.log("🚀 ItplayLab server booted - USING THIS index.js");
 
+let lastJobLogAt = 0;
+
 app.use((req, res, next) => {
+  if (req.path === "/next-job") {
+    const now = Date.now();
+    if (now - lastJobLogAt > 30000) { // 30초에 한 번만 로그
+      console.log(
+        `[JOBQUEUE] ${new Date().toISOString()} ${req.method} ${req.url}`
+      );
+      lastJobLogAt = now;
+    }
+    return next();
+  }
+
   console.log(
     `[REQ] ${new Date().toISOString()} ${req.method} ${req.url} ct=${
       req.headers["content-type"] || ""
@@ -130,6 +143,7 @@ app.use((req, res, next) => {
   );
   next();
 });
+
 
 app.use(express.json({ limit: "1mb", type: ["application/json"] }));
 
