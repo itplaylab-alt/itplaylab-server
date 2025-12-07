@@ -20,7 +20,13 @@ import {
   createJobFromPlanQueueRow,
 } from "./src/jobRepo.js";
 import { startVideoGeneration } from "./src/videoFactoryClient.js";
-
+import { logToSheet } from "./services/gasLogger.js";
+import {
+  tgSend,
+  tgAnswerCallback,
+  buildNotifyMessage,
+  shouldNotify,
+} from "./services/telegramBot.js";
 /* ────────────────────────────────────────────────────────────
    1) ENV & 상수
 ──────────────────────────────────────────────────────────── */
