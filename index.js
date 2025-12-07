@@ -176,8 +176,7 @@ app.use("/videos", express.static(path.join(__dirname, "videos")));
 ──────────────────────────────────────────────────────────── */
 const genTraceId = () => `trc_${crypto.randomBytes(4).toString("hex")}`;
 const nowISO = () => new Date().toISOString();
-const fmtTsKR = (d = new Date()) =>
-  d.toLocaleString("ko-KR", { timeZone: "Asia/Seoul", hour12: false });
+
 const fmtTrace = (id) => `trace_id: <code>${id}</code>`;
 const fmtTitle = (t) => `제목: <b>${t}</b>`;
 
@@ -192,10 +191,6 @@ const DEFAULT_CHECKLIST = [
   { key: "thumbnail", label: "썸네일 적합성" },
 ];
 
-const shouldNotify = (kind) =>
-  NOTIFY_LEVEL.split(",")
-    .map((s) => s.trim().toLowerCase())
-    .includes(kind);
 
 const labelOf = (key) =>
   DEFAULT_CHECKLIST.find((i) => i.key === key)?.label || key;
@@ -217,17 +212,6 @@ function approverName(from) {
   return p.join(" ") || from?.username || `user_${from?.id || "unknown"}`;
 }
 
-function buildNotifyMessage({ type, title, message }) {
-  const ts = fmtTsKR();
-  if (type === "success")
-    return `✅ <b>${title || "처리 완료"}</b>\n${message || ""}\n\n🕒 ${ts}`;
-  if (type === "error")
-    return `❌ <b>${title || "오류 발생"}</b>\n${message || ""}\n\n🕒 ${ts}`;
-  if (type === "approval")
-    return `🟡 <b>${title || "승인 요청"}</b>\n${message || ""}\n\n🕒 ${ts}`;
-  return `ℹ️ <b>${title || "알림"}</b>\n${message || ""}\n\n🕒 ${ts}`;
-}
-
 function requireOpenAI(res) {
   if (!OPENAI_API_KEY) {
     res.status(500).json({ ok: false, error: "OPENAI_API_KEY missing" });
@@ -236,77 +220,6 @@ function requireOpenAI(res) {
   return true;
 }
 
-/* GAS 로깅 */
-async function logToSheet(payload) {
-  const t0 = Date.now();
-  if (!GAS_INGEST_URL || !INGEST_TOKEN) return { ok: false, skipped: true };
-  try {
-    await axios.post(GAS_INGEST_URL, {
-      token: INGEST_TOKEN,
-      contents: JSON.stringify({
-        timestamp: new Date().toISOString(),
-        chat_id: String(payload.chat_id ?? "system"),
-        username: String(payload.username ?? "render_system"),
-        type: String(payload.type ?? "system_log"),
-        input_text: String(payload.input_text ?? ""),
-        output_text:
-          typeof payload.output_text === "string"
-            ? payload.output_text
-            : JSON.stringify(payload.output_text ?? ""),
-        source: String(payload.source ?? "Render"),
-        note: String(payload.note ?? ""),
-        project: String(payload.project ?? PROJECT),
-        category: String(payload.category ?? "system"),
-        service: String(SERVICE_NAME),
-        latency_ms: payload.latency_ms ?? 0,
-        trace_id: payload.trace_id || "",
-        step: payload.step || "",
-        ok: typeof payload.ok === "boolean" ? payload.ok : "",
-        error: payload.error || "",
-        provider: payload.provider || "",
-        revision_count:
-          typeof payload.revision_count === "number"
-            ? payload.revision_count
-            : "",
-      }),
-    });
-    return { ok: true, latency_ms: Date.now() - t0 };
-  } catch (e) {
-    console.error("❌ GAS log fail:", e?.message);
-    return {
-      ok: false,
-      error: e?.message,
-      latency_ms: Date.now() - t0,
-    };
-  }
-}
-
-/* 텔레그램 */
-async function tgSend(chatId, text, parse_mode = "HTML", extra = {}) {
-  if (!TELEGRAM_TOKEN || !chatId) return;
-  try {
-    return await axios.post(`${TELEGRAM_API}/sendMessage`, {
-      chat_id: chatId,
-      text,
-      parse_mode,
-      disable_web_page_preview: true,
-      ...extra,
-    });
-  } catch (e) {
-    console.error("Telegram send error:", e?.message);
-  }
-}
-async function tgAnswerCallback(id, text = "", show_alert = false) {
-  try {
-    return await axios.post(`${TELEGRAM_API}/answerCallbackQuery`, {
-      callback_query_id: id,
-      text,
-      show_alert,
-    });
-  } catch (e) {
-    console.error("Telegram answerCallbackQuery error:", e?.message);
-  }
-}
 
 /* Telegram 명령 파서 */
 function parseTelegramCommand(text) {
