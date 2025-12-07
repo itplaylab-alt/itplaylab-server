@@ -63,7 +63,8 @@ const nowISO = () => new Date().toISOString();
 // ─────────────────────────────────────────
 // 1) Telegram Webhook 처리
 // ─────────────────────────────────────────
-app.post("/tg-webhook", async (req, res) => {
+// 1) Telegram Webhook 처리
+const handleTelegramWebhook = async (req, res) => {
   const body = req.body;
 
   try {
@@ -76,11 +77,9 @@ app.post("/tg-webhook", async (req, res) => {
 
     const traceId = genTraceId();
 
-    // 요청 접수 알림
     if (shouldNotify("success"))
       await tgSend(chatId, `✅ 요청 접수\ntrace_id: ${traceId}`);
 
-    // Job Row 생성
     const newJob = await createJobFromPlanQueueRow(text, traceId, chatId);
 
     if (!newJob.ok) {
@@ -93,7 +92,11 @@ app.post("/tg-webhook", async (req, res) => {
     console.error("tg-webhook error:", e);
     res.json({ ok: false, error: e.message });
   }
-});
+};
+
+// 둘 다 같은 핸들러 사용
+app.post("/tg-webhook", handleTelegramWebhook);
+app.post("/telegram/webhook", handleTelegramWebhook);
 
 // ─────────────────────────────────────────
 // 2) Worker 전용 엔드포인트 (/next-job)
