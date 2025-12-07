@@ -1,31 +1,57 @@
 // services/gasLogger.js
-import fetch from "node-fetch";
+import axios from "axios";
 import { CONFIG } from "../lib/config.js";
+
+const { GAS_INGEST_URL, INGEST_TOKEN, PROJECT, SERVICE_NAME } = CONFIG;
 
 /**
  * GAS 스프레드시트 로깅 서비스
- * - logToSheet(type, input_text, output_text, meta)
+ * - 기존 index.js 의 logToSheet 그대로 옮긴 버전
  */
 export async function logToSheet(payload = {}) {
-  try {
-    if (!CONFIG.GAS_INGEST_URL || !CONFIG.INGEST_TOKEN) {
-      console.warn("⚠️ GAS 로깅이 비활성화됨: 환경변수 없음");
-      return { ok: false, disabled: true };
-    }
+  const t0 = Date.now();
+  if (!GAS_INGEST_URL || !INGEST_TOKEN) {
+    return { ok: false, skipped: true };
+  }
 
-    const res = await fetch(CONFIG.GAS_INGEST_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${CONFIG.INGEST_TOKEN}`,
-      },
-      body: JSON.stringify(payload),
+  try {
+    await axios.post(GAS_INGEST_URL, {
+      token: INGEST_TOKEN,
+      contents: JSON.stringify({
+        timestamp: new Date().toISOString(),
+        chat_id: String(payload.chat_id ?? "system"),
+        username: String(payload.username ?? "render_system"),
+        type: String(payload.type ?? "system_log"),
+        input_text: String(payload.input_text ?? ""),
+        output_text:
+          typeof payload.output_text === "string"
+            ? payload.output_text
+            : JSON.stringify(payload.output_text ?? ""),
+        source: String(payload.source ?? "Render"),
+        note: String(payload.note ?? ""),
+        project: String(payload.project ?? PROJECT),
+        category: String(payload.category ?? "system"),
+        service: String(SERVICE_NAME),
+        latency_ms: payload.latency_ms ?? 0,
+        trace_id: payload.trace_id || "",
+        step: payload.step || "",
+        ok: typeof payload.ok === "boolean" ? payload.ok : "",
+        error: payload.error || "",
+        provider: payload.provider || "",
+        revision_count:
+          typeof payload.revision_count === "number"
+            ? payload.revision_count
+            : "",
+      }),
     });
 
-    const text = await res.text();
-    return { ok: true, status: res.status, text };
-  } catch (err) {
-    console.error("🚨 GAS 로깅 오류:", err);
-    return { ok: false, error: err.message };
+    return { ok: true, latency_ms: Date.now() - t0 };
+  } catch (e) {
+    console.error("❌ GAS log fail:", e?.message);
+    return {
+      ok: false,
+      error: e?.message,
+      latency_ms: Date.now() - t0,
+    };
   }
 }
