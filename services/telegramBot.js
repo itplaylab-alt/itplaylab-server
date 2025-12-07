@@ -1,67 +1,67 @@
 // services/telegramBot.js
+import axios from "axios";
 import { CONFIG } from "../lib/config.js";
 
-/**
- * Telegram Bot API wrapper
- * - tgSend(chatId, text, parseMode)
- * - tgAnswerCallback(callbackQueryId, text, alert)
- */
+const { TELEGRAM_TOKEN, TELEGRAM_ADMIN_CHAT_ID, NOTIFY_LEVEL } = CONFIG;
 
-const BOT_TOKEN = CONFIG.TELEGRAM_BOT_TOKEN;
-const ADMIN_CHAT_ID = CONFIG.TELEGRAM_ADMIN_CHAT_ID;
+const TELEGRAM_API = TELEGRAM_TOKEN
+  ? `https://api.telegram.org/bot${TELEGRAM_TOKEN}`
+  : null;
 
-if (!BOT_TOKEN) {
-  console.warn("⚠️ TELEGRAM_BOT_TOKEN 환경변수 없음 — Telegram 기능 비활성화");
+const fmtTsKR = (d = new Date()) =>
+  d.toLocaleString("ko-KR", { timeZone: "Asia/Seoul", hour12: false });
+
+export const shouldNotify = (kind) =>
+  NOTIFY_LEVEL.split(",")
+    .map((s) => s.trim().toLowerCase())
+    .includes(kind);
+
+export function buildNotifyMessage({ type, title, message }) {
+  const ts = fmtTsKR();
+  if (type === "success")
+    return `✅ <b>${title || "처리 완료"}</b>\n${message || ""}\n\n🕒 ${ts}`;
+  if (type === "error")
+    return `❌ <b>${title || "오류 발생"}</b>\n${message || ""}\n\n🕒 ${ts}`;
+  if (type === "approval")
+    return `🟡 <b>${title || "승인 요청"}</b>\n${message || ""}\n\n🕒 ${ts}`;
+  return `ℹ️ <b>${title || "알림"}</b>\n${message || ""}\n\n🕒 ${ts}`;
 }
 
-const BASE_URL = `https://api.telegram.org/bot${BOT_TOKEN}`;
-
-// 공용 fetch 함수
-async function callTelegram(method, body = {}) {
-  if (!BOT_TOKEN) return { ok: false, disabled: true };
-
+export async function tgSend(
+  chatId,
+  text,
+  parse_mode = "HTML",
+  extra = {}
+) {
+  if (!TELEGRAM_API || !chatId) return;
   try {
-    const res = await fetch(`${BASE_URL}/${method}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+    return await axios.post(`${TELEGRAM_API}/sendMessage`, {
+      chat_id: chatId,
+      text,
+      parse_mode,
+      disable_web_page_preview: true,
+      ...extra,
     });
-
-    const data = await res.json();
-    return data;
-  } catch (err) {
-    console.error("❌ Telegram API Error:", err);
-    return { ok: false, error: err.message };
+  } catch (e) {
+    console.error("Telegram send error:", e?.message);
   }
 }
 
-/**
- * 메시지 전송
- */
-export async function tgSend(chatId, text, parseMode = "HTML") {
-  return await callTelegram("sendMessage", {
-    chat_id: chatId,
-    text,
-    parse_mode: parseMode,
-    disable_web_page_preview: true,
-  });
+export async function tgAnswerCallback(id, text = "", show_alert = false) {
+  if (!TELEGRAM_API) return;
+  try {
+    return await axios.post(`${TELEGRAM_API}/answerCallbackQuery`, {
+      callback_query_id: id,
+      text,
+      show_alert,
+    });
+  } catch (e) {
+    console.error("Telegram answerCallbackQuery error:", e?.message);
+  }
 }
 
-/**
- * Callback 응답
- */
-export async function tgAnswerCallback(callbackQueryId, text, alert = false) {
-  return await callTelegram("answerCallbackQuery", {
-    callback_query_id: callbackQueryId,
-    text,
-    show_alert: alert,
-  });
-}
-
-/**
- * Admin에게 알림 보내기 (선택적)
- */
+/** 옵션: 관리자 채널로 바로 보내기 */
 export async function sendAdmin(text) {
-  if (!ADMIN_CHAT_ID) return;
-  return await tgSend(ADMIN_CHAT_ID, text);
+  if (!TELEGRAM_ADMIN_CHAT_ID) return;
+  return tgSend(TELEGRAM_ADMIN_CHAT_ID, text);
 }
