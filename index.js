@@ -1,5 +1,6 @@
-// index.js — ItplayLab 운영 통합본 (정리 버전)
-// Node 18+ / ESM. 필요한 패키지: express, axios, openai, @supabase/supabase-js
+// index.js — ItplayLab 운영 통합본 (정리 버전 - lite refactor)
+// Node 18+ / ESM
+// 필요한 패키지: express, axios, openai, @supabase/supabase-js
 
 import dotenv from "dotenv";
 dotenv.config();
@@ -21,11 +22,62 @@ import {
 import { startVideoGeneration } from "./src/videoFactoryClient.js";
 
 /* ────────────────────────────────────────────────────────────
-   Supabase 설정
+   1) ENV & 상수
 ──────────────────────────────────────────────────────────── */
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+const {
+  // Telegram / Notify
+  TELEGRAM_TOKEN,
+  TELEGRAM_ADMIN_CHAT_ID,
+  NOTIFY_LEVEL = "success,error,approval",
 
+  // GAS / 로그
+  GAS_INGEST_URL,
+  INGEST_TOKEN,
+
+  // OpenAI
+  OPENAI_API_KEY,
+  OPENAI_MODEL_RESP = "gpt-4.1-mini",
+  OPENAI_MODEL_FALLBACK = "gpt-4o-mini",
+  OPENAI_MODEL,
+
+  // 프로젝트 메타
+  PROJECT = "itplaylab",
+  SERVICE_NAME = "render-bot",
+
+  // 파이프라인/승인
+  APPROVAL_MODE: APPROVAL_MODE_RAW = "true",
+  MAX_REVISIONS: MAX_REVISIONS_RAW = "3",
+
+  // JobQueue 인증
+  JOBQUEUE_WORKER_SECRET = "",
+  INTERNAL_API_KEY,
+
+  // Supabase
+  SUPABASE_URL,
+  SUPABASE_SERVICE_KEY,
+
+  // AutoPilot
+  GAS_AUTOPILOT_URL,
+  AUTOPILOT_API_KEY,
+  AUTOPILOT_ENV,
+  AUTOPILOT_SHEET_ID,
+
+  // 서버
+  PORT: PORT_RAW = "10000",
+  IS_DEV: IS_DEV_RAW = "false",
+} = process.env;
+
+const APPROVAL_MODE = String(APPROVAL_MODE_RAW).toLowerCase() === "true";
+const MAX_REVISIONS = Number(MAX_REVISIONS_RAW) || 3;
+const PORT = Number(PORT_RAW) || 10000;
+const IS_DEV = String(IS_DEV_RAW).toLowerCase() === "true";
+
+const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
+const oa = new OpenAI({ apiKey: OPENAI_API_KEY });
+
+/* ────────────────────────────────────────────────────────────
+   2) 외부 클라이언트 (Supabase / REST / OpenAI / 경로)
+──────────────────────────────────────────────────────────── */
 const supabaseRest =
   SUPABASE_URL && SUPABASE_SERVICE_KEY
     ? axios.create({
@@ -44,161 +96,6 @@ const supabase =
         auth: { persistSession: false },
       })
     : null;
-
-// Supabase job_queue에서 PENDING 하나 꺼내 RUNNING 으로 잠그기
-async function popNextJobFromSupabase() {
-  if (!supabaseRest) {
-    throw new Error("supabase_not_configured");
-  }
-
-  // 1) 가장 오래된 PENDING job 1개 조회
-  const { data: jobs } = await supabaseRest.get("/job_queue", {
-    params: {
-      select: "*",
-      status: "eq.PENDING",
-      order: "created_at.asc",
-      limit: 1,
-    },
-  });
-
-  if (!jobs || jobs.length === 0) {
-    return null;
-  }
-
-  const job = jobs[0];
-
-  // 2) RUNNING 으로 잠그기
-  const updates = {
-    status: "RUNNING",
-    locked_at: new Date().toISOString(),
-    locked_by: "server",
-  };
-
-  await supabaseRest.patch(`/job_queue?id=eq.${job.id}`, updates);
-
-  return { ...job, ...updates };
-}
-
-/* ────────────────────────────────────────────────────────────
-   Express 기본 설정
-──────────────────────────────────────────────────────────── */
-const app = express();
-console.log("🚀 ItplayLab server booted - USING THIS index.js");
-
-app.use((req, res, next) => {
-  console.log(
-    `[REQ] ${new Date().toISOString()} ${req.method} ${req.url} ct=${
-      req.headers["content-type"] || ""
-    }`
-  );
-  next();
-});
-app.use(express.json({ limit: "1mb", type: ["application/json"] }));
-
-// Healthcheck (Render / PowerShell 확인용)
-app.get("/healthcheck", (req, res) => {
-  res.status(200).json({
-    ok: true,
-    service: "itplaylab-server",
-    ts: new Date().toISOString(),
-    env: {
-      approval_mode: process.env.APPROVAL_MODE || null,
-      autopilot_env: process.env.AUTOPILOT_ENV || null,
-      has_sheet_id: !!process.env.AUTOPILOT_SHEET_ID,
-      has_gas_url: !!process.env.GAS_AUTOPILOT_URL,
-    },
-  });
-});
-
-// AutoPilot v1 – PlanQueue 실데이터 수신 + JobRow 생성
-app.post("/autopilot/planqueue", async (req, res) => {
-  try {
-    const body = req.body || {};
-    const { secret, payload } = body;
-
-    if (!secret || secret !== process.env.AUTOPILOT_API_KEY) {
-      console.warn("[AUTOPILOT][PLANQUEUE] ❌ invalid secret");
-      return res.status(401).json({
-        ok: false,
-        error: "invalid_secret",
-      });
-    }
-
-    console.log(
-      "[AUTOPILOT][PLANQUEUE] ✅ received:",
-      JSON.stringify(payload, null, 2)
-    );
-
-    const job = await createJobFromPlanQueueRow(payload);
-
-    if (!job) {
-      console.warn("[AUTOPILOT][PLANQUEUE] ❌ job create 실패");
-      return res.status(500).json({
-        ok: false,
-        error: "job_create_failed",
-      });
-    }
-
-    console.log("[AUTOPILOT][PLANQUEUE] ✅ JobRow created:", job);
-
-    return res.status(200).json({
-      ok: true,
-      job,
-    });
-  } catch (err) {
-    console.error("[AUTOPILOT][PLANQUEUE] ❌ error:", err);
-    return res.status(500).json({
-      ok: false,
-      error: "server_error",
-      detail: err.message,
-    });
-  }
-});
-
-// JSON 파서 에러 처리
-app.use((err, req, res, next) => {
-  if (err?.type === "entity.parse.failed" || err instanceof SyntaxError) {
-    console.error("❌ JSON parse error:", err.message);
-    return res.status(400).json({
-      ok: false,
-      error: "invalid_json",
-      detail: err.message,
-    });
-  }
-  next();
-});
-
-// 디버그 에코
-app.post("/debug/echo", (req, res) =>
-  res.json({ ok: true, headers: req.headers, body: req.body })
-);
-
-/* ────────────────────────────────────────────────────────────
-   1) ENV & 상수
-──────────────────────────────────────────────────────────── */
-const {
-  TELEGRAM_TOKEN,
-  TELEGRAM_ADMIN_CHAT_ID,
-  NOTIFY_LEVEL = "success,error,approval",
-  GAS_INGEST_URL,
-  INGEST_TOKEN,
-  OPENAI_API_KEY,
-  OPENAI_MODEL_RESP = "gpt-4.1-mini",
-  OPENAI_MODEL_FALLBACK = "gpt-4o-mini",
-  OPENAI_MODEL,
-  PROJECT = "itplaylab",
-  SERVICE_NAME = "render-bot",
-  APPROVAL_MODE: APPROVAL_MODE_RAW = "true",
-  MAX_REVISIONS: MAX_REVISIONS_RAW = "3",
-  JOBQUEUE_WORKER_SECRET = "",
-  INTERNAL_API_KEY,
-} = process.env;
-
-const APPROVAL_MODE = String(APPROVAL_MODE_RAW).toLowerCase() === "true";
-const MAX_REVISIONS = Number(MAX_REVISIONS_RAW) || 3;
-
-const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
-const oa = new OpenAI({ apiKey: OPENAI_API_KEY });
 
 /* AJV 동적 로드(없어도 동작) */
 let _ajv = null;
@@ -220,7 +117,42 @@ async function ensureAjv() {
 }
 
 /* ────────────────────────────────────────────────────────────
-   2) 유틸 & 공통 함수
+   3) Express 앱 & 공통 미들웨어
+──────────────────────────────────────────────────────────── */
+const app = express();
+console.log("🚀 ItplayLab server booted - USING THIS index.js");
+
+app.use((req, res, next) => {
+  console.log(
+    `[REQ] ${new Date().toISOString()} ${req.method} ${req.url} ct=${
+      req.headers["content-type"] || ""
+    }`
+  );
+  next();
+});
+
+app.use(express.json({ limit: "1mb", type: ["application/json"] }));
+
+// JSON 파서 에러 처리
+app.use((err, req, res, next) => {
+  if (err?.type === "entity.parse.failed" || err instanceof SyntaxError) {
+    console.error("❌ JSON parse error:", err.message);
+    return res.status(400).json({
+      ok: false,
+      error: "invalid_json",
+      detail: err.message,
+    });
+  }
+  next();
+});
+
+// 정적 /videos 제공
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+app.use("/videos", express.static(path.join(__dirname, "videos")));
+
+/* ────────────────────────────────────────────────────────────
+   4) 공통 유틸
 ──────────────────────────────────────────────────────────── */
 const genTraceId = () => `trc_${crypto.randomBytes(4).toString("hex")}`;
 const nowISO = () => new Date().toISOString();
@@ -228,6 +160,7 @@ const fmtTsKR = (d = new Date()) =>
   d.toLocaleString("ko-KR", { timeZone: "Asia/Seoul", hour12: false });
 const fmtTrace = (id) => `trace_id: <code>${id}</code>`;
 const fmtTitle = (t) => `제목: <b>${t}</b>`;
+
 const STEP_LABELS = { brief: "브리프", script: "스크립트", assets: "에셋/메타" };
 const labelStep = (s) => STEP_LABELS[s] || s;
 
@@ -355,136 +288,49 @@ async function tgAnswerCallback(id, text = "", show_alert = false) {
   }
 }
 
-/* 정적 /videos 제공 */
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-app.use("/videos", express.static(path.join(__dirname, "videos")));
+/* Telegram 명령 파서 */
+function parseTelegramCommand(text) {
+  const [cmd, idOrText, ...rest] = text.trim().split(/\s+/);
+  const trace_id =
+    idOrText && idOrText.startsWith("trc_") ? idOrText : undefined;
+  const argsText = rest.join(" ");
+  const stepMatch = argsText.match(/step=([a-z]+)/i);
+  const reasonMatch = argsText.match(/reason=("([^"]+)"|([^\s]+))/i);
+  const reason = reasonMatch ? reasonMatch[2] || reasonMatch[3] : undefined;
+  const step = stepMatch ? stepMatch[1] : undefined;
+  return { cmd, trace_id, step, reason };
+}
 
-/* ────────────────────────────────────────────────────────────
-   3) 테스트 라우트 & JobRepo 연동
-──────────────────────────────────────────────────────────── */
-app.get("/__ping", (req, res) => {
-  console.log("[HEALTH] __ping called");
-  res.send("OK");
-});
+/* 자연어 파서 */
+function parseFreeText(text) {
+  const lower = text.toLowerCase();
+  let steps = ["brief", "script", "assets"];
+  if (lower.includes("브리프")) steps = ["brief"];
+  if (lower.includes("스크립트")) steps = ["script"];
+  if (lower.includes("에셋") || lower.includes("메타")) steps = ["assets"];
+  const title =
+    text
+      .replace(/(브리프|스크립트|에셋|만들어줘|전체|전부|메타|전략)/g, "")
+      .trim() || "무제";
+  const profileMatch = text.match(/profile=([\w-]+)/i);
+  const profile = profileMatch ? profileMatch[1] : "-";
+  return { title, steps, profile };
+}
 
-app.get("/test/healthcheck", (req, res) => {
-  console.log("[HEALTH] /test/healthcheck hit");
-  res.json({
-    ok: true,
-    service: "Render → GAS Bridge + Notify + Approval Loop",
-    status: "Render is alive ✅",
-    timestamp: new Date().toISOString(),
-    approval_mode: APPROVAL_MODE,
+/* AutoPilot GAS 호출 */
+async function callAutopilotGAS(action, payload = {}) {
+  if (!GAS_AUTOPILOT_URL || !AUTOPILOT_API_KEY) {
+    throw new Error("GAS_AUTOPILOT_URL or AUTOPILOT_API_KEY not configured");
+  }
+  const res = await axios.post(GAS_AUTOPILOT_URL, {
+    action,
+    api_key: AUTOPILOT_API_KEY,
+    ...payload,
   });
-});
+  return res.data;
+}
 
-app.get("/test/send-log", async (req, res) => {
-  try {
-    const r = await logToSheet({
-      type: "test_log",
-      input_text: "Render → GAS 연결 테스트",
-      output_text: "✅ Render 서버에서 로그 전송 성공!",
-      project: PROJECT,
-      category: "system",
-    });
-    res.json({ ok: true, sent_to_gas: !!r.ok });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e?.message });
-  }
-});
-
-app.get("/test/notify", async (req, res) => {
-  try {
-    const type = String(req.query.type || "success").toLowerCase();
-    const title = String(req.query.title || "Ping");
-    const message = String(req.query.message || "Render Notify Test");
-    if (!shouldNotify(type))
-      return res.json({
-        ok: true,
-        sent: false,
-        reason: "filtered_by_NOTIFY_LEVEL",
-      });
-    const text = buildNotifyMessage({ type, title, message });
-    await tgSend(TELEGRAM_ADMIN_CHAT_ID, text);
-    await logToSheet({
-      type: `notify_${type}`,
-      input_text: title,
-      output_text: message,
-      project: PROJECT,
-      category: "notify",
-      note: "notify_test",
-    });
-    res.json({ ok: true, sent: true, type });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e?.message });
-  }
-});
-
-// jobRepo 연동 테스트
-app.get("/job/by-trace-id/:trace_id", async (req, res) => {
-  const trace_id = req.params.trace_id;
-  try {
-    const row = await findByTraceId(trace_id);
-    if (!row) {
-      return res
-        .status(404)
-        .json({ ok: false, error: "job_not_found", trace_id });
-    }
-    return res.json({ ok: true, trace_id, row });
-  } catch (e) {
-    console.error("❌ /job/by-trace-id error:", e?.message);
-    return res.status(500).json({
-      ok: false,
-      error: e?.message || "jobRepo_error",
-      trace_id,
-    });
-  }
-});
-
-app.post("/job/update-video", async (req, res) => {
-  const {
-    trace_id,
-    video_status,
-    video_path,
-    video_latency_ms,
-    yt_status,
-    yt_video_id,
-    kpi_grade,
-    error_log,
-  } = req.body || {};
-
-  if (!trace_id) {
-    return res.status(400).json({ ok: false, error: "trace_id_required" });
-  }
-
-  try {
-    const updated = await updateVideoStatus(trace_id, {
-      video_status,
-      video_path,
-      video_latency_ms,
-      yt_status,
-      yt_video_id,
-      kpi_grade,
-      error_log,
-    });
-
-    return res.json({ ok: true, trace_id, row: updated });
-  } catch (e) {
-    console.error("❌ /job/update-video error:", e?.message);
-    return res.status(500).json({
-      ok: false,
-      error: e?.message || "jobRepo_error",
-      trace_id,
-    });
-  }
-});
-
-/* ────────────────────────────────────────────────────────────
-   3-2) JobQueue Worker 라우트
-──────────────────────────────────────────────────────────── */
-
-// Worker 인증
+/* JobQueue 인증 유틸 */
 function requireJobQueueSecret(req, res, next) {
   const secret =
     req.headers["x-jobqueue-secret"] ||
@@ -516,153 +362,11 @@ function requireInternalApiKey(req, res, next) {
   next();
 }
 
-// /next-job: Worker가 다음 작업 가져가기
-async function handleNextJob(req, res) {
-  try {
-    const expected = process.env.JOBQUEUE_WORKER_SECRET;
-    const provided =
-      req.headers["x-jobqueue-secret"] ||
-      req.headers["x-api-key"] ||
-      (req.query && req.query.secret);
-
-    if (expected && expected !== provided) {
-      return res.status(401).json({
-        ok: false,
-        error: "unauthorized_worker",
-      });
-    }
-
-    const job = await popNextJobFromSupabase();
-
-    if (!job) {
-      return res.json({
-        ok: true,
-        has_job: false,
-        job: null,
-        message: "no_pending_job",
-      });
-    }
-
-    return res.json({
-      ok: true,
-      has_job: true,
-      job,
-    });
-  } catch (err) {
-    console.error("❌ /next-job error:", err?.message || err);
-    return res.status(500).json({
-      ok: false,
-      error: "next_job_failed",
-      detail: err?.message || String(err),
-    });
-  }
-}
-
-// /job/:id/status: Worker가 Job 상태 업데이트
-async function handleJobStatusUpdate(req, res) {
-  try {
-    const jobId = req.params.id;
-    const { status, worker_id, latency_ms, error_message } = req.body;
-
-    if (!["DONE", "FAILED"].includes(status)) {
-      return res.status(400).json({ error: "Invalid status" });
-    }
-
-    const nowIso = new Date().toISOString();
-
-    const { data, error } = await supabase
-      .from("job_queue")
-      .update({
-        status,
-        worker_id,
-        latency_ms,
-        error_message,
-        finished_at: nowIso,
-        updated_at: nowIso,
-      })
-      .eq("id", jobId)
-      .select()
-      .maybeSingle();
-
-    if (error) {
-      console.error("❌ job update error:", error);
-      return res.status(500).json({ error: "update_failed", detail: error });
-    }
-
-    return res.json({ ok: true, job: data });
-  } catch (err) {
-    console.error("❌ /job/:id/status error:", err);
-    return res.status(500).json({ error: "server_error" });
-  }
-}
-
-app.post("/next-job", handleNextJob);
-app.get("/next-job", handleNextJob);
-
-app.post(
-  "/job/:id/status",
-  requireJobQueueSecret,
-  express.json(),
-  handleJobStatusUpdate
-);
-
-// /create-job: GAS/내부 시스템이 JobQueue에 작업 생성
-app.post(
-  "/create-job",
-  requireInternalApiKey,
-  express.json(),
-  async (req, res) => {
-    try {
-      const { payload } = req.body || {};
-
-      if (!payload) {
-        return res.status(400).json({
-          ok: false,
-          error: "INVALID_REQUEST",
-          message: "payload is required",
-        });
-      }
-
-      const { data, error } = await supabase
-        .from("job_queue")
-        .insert({
-          status: "PENDING",
-          payload,
-        })
-        .select()
-        .maybeSingle();
-
-      if (error) {
-        console.error("[/create-job] DB ERROR:", error);
-        return res.status(500).json({
-          ok: false,
-          error: "DB_INSERT_FAILED",
-          detail: error,
-        });
-      }
-
-      console.log("[/create-job] CREATED JOB:", data);
-
-      return res.json({
-        ok: true,
-        job: {
-          id: data.id,
-          status: data.status,
-          created_at: data.created_at,
-        },
-      });
-    } catch (err) {
-      console.error("[/create-job] ERROR:", err);
-      return res.status(500).json({
-        ok: false,
-        error: "UNEXPECTED_SERVER_ERROR",
-      });
-    }
-  }
-);
-
-/* 대시보드 */
+/* ────────────────────────────────────────────────────────────
+   5) Trace 상태 & 대시보드
+──────────────────────────────────────────────────────────── */
 const traces = new Map();
+
 function getTraceSnapshot(t) {
   return {
     trace_id: t.id,
@@ -675,6 +379,7 @@ function getTraceSnapshot(t) {
     createdAt: t.createdAt,
   };
 }
+
 function groupActive(limitPerBucket = 20) {
   const buckets = {
     running: [],
@@ -700,13 +405,45 @@ function groupActive(limitPerBucket = 20) {
   const total = Array.from(traces.keys()).length;
   return { total, counts, buckets };
 }
-app.get("/dashboard/active", (req, res) => {
-  const limit = Math.max(1, Math.min(100, Number(req.query.limit || 20)));
-  res.json({ ok: true, ...groupActive(limit) });
-});
 
 /* ────────────────────────────────────────────────────────────
-   4) OpenAI 공용 호출자 (Responses → Fallback)
+   6) Supabase JobQueue 유틸
+──────────────────────────────────────────────────────────── */
+async function popNextJobFromSupabase() {
+  if (!supabaseRest) {
+    throw new Error("supabase_not_configured");
+  }
+
+  // 1) 가장 오래된 PENDING job 1개 조회
+  const { data: jobs } = await supabaseRest.get("/job_queue", {
+    params: {
+      select: "*",
+      status: "eq.PENDING",
+      order: "created_at.asc",
+      limit: 1,
+    },
+  });
+
+  if (!jobs || jobs.length === 0) {
+    return null;
+  }
+
+  const job = jobs[0];
+
+  // 2) RUNNING 으로 잠그기
+  const updates = {
+    status: "RUNNING",
+    locked_at: new Date().toISOString(),
+    locked_by: "server",
+  };
+
+  await supabaseRest.patch(`/job_queue?id=eq.${job.id}`, updates);
+
+  return { ...job, ...updates };
+}
+
+/* ────────────────────────────────────────────────────────────
+   7) OpenAI 공용 호출자 (Responses → Fallback) + 스키마
 ──────────────────────────────────────────────────────────── */
 async function callOpenAIJson({
   system,
@@ -915,12 +652,19 @@ async function aiScriptLite(brief, meta = {}) {
 }
 
 /* ────────────────────────────────────────────────────────────
-   5) 공정 실행기
+   8) 공정 실행기 (executeStep / runFromCurrent / pauseForApproval)
 ──────────────────────────────────────────────────────────── */
+const getNextStep = (trace) =>
+  trace.currentIndex + 1 < trace.steps.length
+    ? trace.steps[trace.currentIndex + 1]
+    : null;
+
 async function executeStep(trace, stepName) {
   const startedAt = nowISO();
   let latency_ms = 0;
   let provider = "";
+  const traceId = trace.id;
+
   try {
     let r;
     if (stepName === "brief") {
@@ -946,7 +690,9 @@ async function executeStep(trace, stepName) {
     provider = r.provider;
     if (!r.ok)
       throw new Error(
-        r.errors?.[0]?.message || r.error || "schema_validation_failed"
+        `[${traceId}][${stepName}] ${
+          r.errors?.[0]?.message || r.error || "schema_validation_failed"
+        }`
       );
 
     trace.history.push({
@@ -991,6 +737,8 @@ async function executeStep(trace, stepName) {
     return { ok: true, latency_ms };
   } catch (e) {
     const error = e?.message || String(e);
+    trace.status = "failed";
+
     trace.history.push({
       step: stepName,
       ok: false,
@@ -1033,14 +781,10 @@ async function executeStep(trace, stepName) {
         })
       );
     }
+    console.error(`[executeStep][${traceId}][${stepName}]`, error);
     throw e;
   }
 }
-
-const getNextStep = (trace) =>
-  trace.currentIndex + 1 < trace.steps.length
-    ? trace.steps[trace.currentIndex + 1]
-    : null;
 
 async function pauseForApproval(trace) {
   const next = getNextStep(trace);
@@ -1124,12 +868,15 @@ async function runFromCurrent(trace) {
   trace.status = "running";
   const stepName = trace.steps[trace.currentIndex];
   await executeStep(trace, stepName);
+
   if (APPROVAL_MODE) {
+    // 한 스텝 완료 후 승인 모드면 무조건 여기서 멈춤
     await pauseForApproval(trace);
   } else {
     trace.currentIndex += 1;
-    if (trace.currentIndex < trace.steps.length) await runFromCurrent(trace);
-    else {
+    if (trace.currentIndex < trace.steps.length) {
+      await runFromCurrent(trace);
+    } else {
       trace.status = "completed";
       if (shouldNotify("success")) {
         const msg = [
@@ -1150,37 +897,318 @@ async function runFromCurrent(trace) {
   }
 }
 
-/* ────────────────────────────────────────────────────────────
-   6) 파서
-──────────────────────────────────────────────────────────── */
-function parseFreeText(text) {
-  const lower = text.toLowerCase();
-  let steps = ["brief", "script", "assets"];
-  if (lower.includes("브리프")) steps = ["brief"];
-  if (lower.includes("스크립트")) steps = ["script"];
-  if (lower.includes("에셋") || lower.includes("메타")) steps = ["assets"];
-  const title =
-    text
-      .replace(/(브리프|스크립트|에셋|만들어줘|전체|전부|메타|전략)/g, "")
-      .trim() || "무제";
-  const profileMatch = text.match(/profile=([\w-]+)/i);
-  const profile = profileMatch ? profileMatch[1] : "-";
-  return { title, steps, profile };
-}
-function parseTelegramCommand(text) {
-  const [cmd, idOrText, ...rest] = text.trim().split(/\s+/);
-  const trace_id =
-    idOrText && idOrText.startsWith("trc_") ? idOrText : undefined;
-  const argsText = rest.join(" ");
-  const stepMatch = argsText.match(/step=([a-z]+)/i);
-  const reasonMatch = argsText.match(/reason=("([^"]+)"|([^\s]+))/i);
-  const reason = reasonMatch ? reasonMatch[2] || reasonMatch[3] : undefined;
-  const step = stepMatch ? stepMatch[1] : undefined;
-  return { cmd, trace_id, step, reason };
+/* 요약 리포트 */
+function buildSummaryReport(trace) {
+  const success = trace.history.filter((h) => h.ok).length;
+  const fail = trace.history.filter((h) => !h.ok).length;
+  const vals = trace.history
+    .map((h) => Number(h.latency_ms || 0))
+    .filter((v) => v > 0);
+  const avgLatency = vals.length
+    ? Math.round(vals.reduce((a, b) => a + b, 0) / vals.length)
+    : 0;
+  const stepsMark = trace.steps
+    .map((s, idx) =>
+      idx < trace.currentIndex
+        ? `✔ ${labelStep(s)}`
+        : idx === trace.currentIndex
+        ? `⏳ ${labelStep(s)}`
+        : `… ${labelStep(s)}`
+    )
+    .join(" → ");
+  const outKeys = Object.keys(trace.lastOutput || {});
+  return [
+    fmtTitle(trace.title),
+    fmtTrace(trace.id),
+    `상태: <b>${trace.status}</b> (수정 회차: ${trace.revisionCount}/${MAX_REVISIONS})`,
+    `진행: ${stepsMark}`,
+    `성공/실패: ${success}/${fail}`,
+    `평균 지연: ${avgLatency}ms`,
+    `산출물: ${outKeys.length ? outKeys.join(", ") : "-"}`,
+  ].join("\n");
 }
 
 /* ────────────────────────────────────────────────────────────
-   7) REST: 콘텐츠 라인
+   9) Health & 테스트 라우트
+──────────────────────────────────────────────────────────── */
+// Healthcheck (Render / PowerShell 확인용)
+app.get("/healthcheck", (req, res) => {
+  res.status(200).json({
+    ok: true,
+    service: "itplaylab-server",
+    ts: new Date().toISOString(),
+    env: {
+      approval_mode: APPROVAL_MODE,
+      autopilot_env: AUTOPILOT_ENV || null,
+      has_sheet_id: !!AUTOPILOT_SHEET_ID,
+      has_gas_url: !!GAS_AUTOPILOT_URL,
+    },
+  });
+});
+
+app.get("/__ping", (req, res) => {
+  console.log("[HEALTH] __ping called");
+  res.send("OK");
+});
+
+app.get("/test/healthcheck", (req, res) => {
+  console.log("[HEALTH] /test/healthcheck hit");
+  res.json({
+    ok: true,
+    service: "Render → GAS Bridge + Notify + Approval Loop",
+    status: "Render is alive ✅",
+    timestamp: new Date().toISOString(),
+    approval_mode: APPROVAL_MODE,
+  });
+});
+
+app.post("/debug/echo", (req, res) =>
+  res.json({ ok: true, headers: req.headers, body: req.body })
+);
+
+app.get("/test/send-log", async (req, res) => {
+  try {
+    const r = await logToSheet({
+      type: "test_log",
+      input_text: "Render → GAS 연결 테스트",
+      output_text: "✅ Render 서버에서 로그 전송 성공!",
+      project: PROJECT,
+      category: "system",
+    });
+    res.json({ ok: true, sent_to_gas: !!r.ok });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message });
+  }
+});
+
+app.get("/test/notify", async (req, res) => {
+  try {
+    const type = String(req.query.type || "success").toLowerCase();
+    const title = String(req.query.title || "Ping");
+    const message = String(req.query.message || "Render Notify Test");
+    if (!shouldNotify(type))
+      return res.json({
+        ok: true,
+        sent: false,
+        reason: "filtered_by_NOTIFY_LEVEL",
+      });
+    const text = buildNotifyMessage({ type, title, message });
+    await tgSend(TELEGRAM_ADMIN_CHAT_ID, text);
+    await logToSheet({
+      type: `notify_${type}`,
+      input_text: title,
+      output_text: message,
+      project: PROJECT,
+      category: "notify",
+      note: "notify_test",
+    });
+    res.json({ ok: true, sent: true, type });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message });
+  }
+});
+
+/* 대시보드 */
+app.get("/dashboard/active", (req, res) => {
+  const limit = Math.max(1, Math.min(100, Number(req.query.limit || 20)));
+  res.json({ ok: true, ...groupActive(limit) });
+});
+
+/* ────────────────────────────────────────────────────────────
+   10) JobRepo 연동 + JobQueue 라우트
+──────────────────────────────────────────────────────────── */
+// jobRepo 연동 테스트
+app.get("/job/by-trace-id/:trace_id", async (req, res) => {
+  const trace_id = req.params.trace_id;
+  try {
+    const row = await findByTraceId(trace_id);
+    if (!row) {
+      return res
+        .status(404)
+        .json({ ok: false, error: "job_not_found", trace_id });
+    }
+    return res.json({ ok: true, trace_id, row });
+  } catch (e) {
+    console.error("❌ /job/by-trace-id error:", e?.message);
+    return res.status(500).json({
+      ok: false,
+      error: e?.message || "jobRepo_error",
+      trace_id,
+    });
+  }
+});
+
+app.post("/job/update-video", async (req, res) => {
+  const {
+    trace_id,
+    video_status,
+    video_path,
+    video_latency_ms,
+    yt_status,
+    yt_video_id,
+    kpi_grade,
+    error_log,
+  } = req.body || {};
+
+  if (!trace_id) {
+    return res.status(400).json({ ok: false, error: "trace_id_required" });
+  }
+
+  try {
+    const updated = await updateVideoStatus(trace_id, {
+      video_status,
+      video_path,
+      video_latency_ms,
+      yt_status,
+      yt_video_id,
+      kpi_grade,
+      error_log,
+    });
+
+    return res.json({ ok: true, trace_id, row: updated });
+  } catch (e) {
+    console.error("❌ /job/update-video error:", e?.message);
+    return res.status(500).json({
+      ok: false,
+      error: e?.message || "jobRepo_error",
+      trace_id,
+    });
+  }
+});
+
+/* JobQueue Worker 핸들러 */
+async function handleNextJob(req, res) {
+  try {
+    const job = await popNextJobFromSupabase();
+
+    if (!job) {
+      return res.json({
+        ok: true,
+        has_job: false,
+        job: null,
+        message: "no_pending_job",
+      });
+    }
+
+    return res.json({
+      ok: true,
+      has_job: true,
+      job,
+    });
+  } catch (err) {
+    console.error("❌ /next-job error:", err?.message || err);
+    return res.status(500).json({
+      ok: false,
+      error: "next_job_failed",
+      detail: err?.message || String(err),
+    });
+  }
+}
+
+async function handleJobStatusUpdate(req, res) {
+  try {
+    const jobId = req.params.id;
+    const { status, worker_id, latency_ms, error_message } = req.body;
+
+    if (!["DONE", "FAILED"].includes(status)) {
+      return res.status(400).json({ error: "Invalid status" });
+    }
+
+    const ts = new Date().toISOString();
+
+    const { data, error } = await supabase
+      .from("job_queue")
+      .update({
+        status,
+        worker_id,
+        latency_ms,
+        error_message,
+        finished_at: ts,
+        updated_at: ts,
+      })
+      .eq("id", jobId)
+      .select()
+      .maybeSingle();
+
+    if (error) {
+      console.error("❌ job update error:", error);
+      return res.status(500).json({ error: "update_failed", detail: error });
+    }
+
+    return res.json({ ok: true, job: data });
+  } catch (err) {
+    console.error("❌ /job/:id/status error:", err);
+    return res.status(500).json({ error: "server_error" });
+  }
+}
+
+app.post("/next-job", requireJobQueueSecret, handleNextJob);
+app.get("/next-job", requireJobQueueSecret, handleNextJob);
+
+app.post(
+  "/job/:id/status",
+  requireJobQueueSecret,
+  express.json(),
+  handleJobStatusUpdate
+);
+
+// /create-job: GAS/내부 시스템이 JobQueue에 작업 생성
+app.post(
+  "/create-job",
+  requireInternalApiKey,
+  express.json(),
+  async (req, res) => {
+    try {
+      const { payload } = req.body || {};
+
+      if (!payload) {
+        return res.status(400).json({
+          ok: false,
+          error: "INVALID_REQUEST",
+          message: "payload is required",
+        });
+      }
+
+      const { data, error } = await supabase
+        .from("job_queue")
+        .insert({
+          status: "PENDING",
+          payload,
+        })
+        .select()
+        .maybeSingle();
+
+      if (error) {
+        console.error("[/create-job] DB ERROR:", error);
+        return res.status(500).json({
+          ok: false,
+          error: "DB_INSERT_FAILED",
+          detail: error,
+        });
+      }
+
+      console.log("[/create-job] CREATED JOB:", data);
+
+      return res.json({
+        ok: true,
+        job: {
+          id: data.id,
+          status: data.status,
+          created_at: data.created_at,
+        },
+      });
+    } catch (err) {
+      console.error("[/create-job] ERROR:", err);
+      return res.status(500).json({
+        ok: false,
+        error: "UNEXPECTED_SERVER_ERROR",
+      });
+    }
+  }
+);
+
+/* ────────────────────────────────────────────────────────────
+   11) 콘텐츠 REST 라인 (Lite/Deep + Pipeline)
 ──────────────────────────────────────────────────────────── */
 app.post("/content/lite/brief", async (req, res) => {
   if (!requireOpenAI(res)) return;
@@ -1439,7 +1467,7 @@ app.post("/content/pipeline", async (req, res) => {
   }
 });
 
-/* 승인/반려/상태/리포트 */
+/* 승인/반려/상태/리포트 REST */
 app.post("/approve", async (req, res) => {
   const { trace_id, step, checks = [], by = "api" } = req.body || {};
   const trace = traces.get(trace_id);
@@ -1551,38 +1579,8 @@ app.get("/status/:trace_id", (req, res) => {
   });
 });
 
-function buildSummaryReport(trace) {
-  const success = trace.history.filter((h) => h.ok).length;
-  const fail = trace.history.filter((h) => !h.ok).length;
-  const vals = trace.history
-    .map((h) => Number(h.latency_ms || 0))
-    .filter((v) => v > 0);
-  const avgLatency = vals.length
-    ? Math.round(vals.reduce((a, b) => a + b, 0) / vals.length)
-    : 0;
-  const stepsMark = trace.steps
-    .map((s, idx) =>
-      idx < trace.currentIndex
-        ? `✔ ${labelStep(s)}`
-        : idx === trace.currentIndex
-        ? `⏳ ${labelStep(s)}`
-        : `… ${labelStep(s)}`
-    )
-    .join(" → ");
-  const outKeys = Object.keys(trace.lastOutput || {});
-  return [
-    fmtTitle(trace.title),
-    fmtTrace(trace.id),
-    `상태: <b>${trace.status}</b> (수정 회차: ${trace.revisionCount}/${MAX_REVISIONS})`,
-    `진행: ${stepsMark}`,
-    `성공/실패: ${success}/${fail}`,
-    `평균 지연: ${avgLatency}ms`,
-    `산출물: ${outKeys.length ? outKeys.join(", ") : "-"}`,
-  ].join("\n");
-}
-
 /* ────────────────────────────────────────────────────────────
-   8) Telegram Webhook
+   12) Telegram Webhook (승인/반려/자연어 → 파이프라인)
 ──────────────────────────────────────────────────────────── */
 app.get("/test/gas-log", async (req, res) => {
   try {
@@ -1616,12 +1614,13 @@ app.get("/test/gas-log", async (req, res) => {
 });
 
 app.post("/telegram/webhook", async (req, res) => {
+  const body = req.body || {};
+
   try {
-    const body = req.body || {};
     const cq = body.callback_query || null;
     const message = body.message || body.edited_message || cq?.message || null;
 
-    // Telegram → GAS 공용 로깅
+    // Telegram → GAS 공용 로깅 (best-effort)
     try {
       const fromAll = cq?.from || message?.from || {};
       const chatForLog = message?.chat || cq?.message?.chat || {};
@@ -1804,6 +1803,7 @@ app.post("/telegram/webhook", async (req, res) => {
     const chatId = message.chat.id;
     const text = message.text.trim();
 
+    // 슬래시 명령들
     if (text.startsWith("/approve") || text.startsWith("/승인")) {
       const { trace_id, step } = parseTelegramCommand(text);
       const checks = parseChecks(text);
@@ -1844,7 +1844,11 @@ app.post("/telegram/webhook", async (req, res) => {
         ok: true,
       });
 
-      await runFromCurrent(trace);
+      try {
+        await runFromCurrent(trace);
+      } catch (err) {
+        console.error("[runFromCurrent] error:", err);
+      }
 
       const msg = [
         fmtTitle(trace.title),
@@ -1971,7 +1975,7 @@ app.post("/telegram/webhook", async (req, res) => {
       return res.json({ ok: true });
     }
 
-    // 자연어 요청 (트레이스 생성)
+    // 자연어 요청 (트레이스 생성 → runFromCurrent)
     if (!text.startsWith("/")) {
       const { title, steps, profile } = parseFreeText(text);
       const trace_id = genTraceId();
@@ -1992,6 +1996,7 @@ app.post("/telegram/webhook", async (req, res) => {
 
       traces.set(trace_id, trace);
 
+      // 1) 요청 접수 알림
       await tgSend(
         chatId,
         buildNotifyMessage({
@@ -2001,10 +2006,27 @@ app.post("/telegram/webhook", async (req, res) => {
         })
       );
 
+      let error = null;
       try {
         await runFromCurrent(trace);
       } catch (err) {
-        console.error("[runFromCurrent] error:", err);
+        error = err;
+        console.error("[runFromCurrent][telegram text] error:", err);
+        trace.status = "failed";
+
+        if (shouldNotify("error")) {
+          await tgSend(
+            chatId,
+            buildNotifyMessage({
+              type: "error",
+              title: "파이프라인 실행 오류",
+              message: [
+                fmtTrace(trace_id),
+                `메시지: <code>${err?.message || "unknown"}</code>`,
+              ].join("\n"),
+            })
+          );
+        }
       }
 
       await logToSheet({
@@ -2015,9 +2037,11 @@ app.post("/telegram/webhook", async (req, res) => {
         category: "chat",
         note: `trace=${trace_id}`,
         trace_id,
+        ok: !error,
+        error: error?.message,
       });
 
-      return res.json({ ok: true });
+      return res.json({ ok: !error });
     }
 
     // 기타: 에코
@@ -2025,10 +2049,17 @@ app.post("/telegram/webhook", async (req, res) => {
     return res.json({ ok: true });
   } catch (e) {
     console.error("❌ /telegram/webhook error:", e?.message);
-    if (shouldNotify("error")) {
+
+    // 사용자/관리자 모두에게 에러 알림 (가능한 경우)
+    const chatIdForError =
+      body?.message?.chat?.id ||
+      body?.callback_query?.message?.chat?.id ||
+      TELEGRAM_ADMIN_CHAT_ID;
+
+    if (shouldNotify("error") && chatIdForError) {
       try {
         await tgSend(
-          TELEGRAM_ADMIN_CHAT_ID,
+          chatIdForError,
           buildNotifyMessage({
             type: "error",
             title: "Webhook 처리 오류",
@@ -2036,9 +2067,10 @@ app.post("/telegram/webhook", async (req, res) => {
           })
         );
       } catch (err) {
-        console.error("tgSend admin error:", err);
+        console.error("tgSend error to user/admin:", err);
       }
     }
+
     return res.sendStatus(500);
   }
 });
@@ -2066,7 +2098,7 @@ app.post("/", async (req, res) => {
 
     res.sendStatus(200);
   } catch (e) {
-    console.error("❌ webhook error:", e?.message);
+    console.error("❌ root webhook error:", e?.message);
     if (shouldNotify("error")) {
       try {
         await tgSend(
@@ -2083,7 +2115,7 @@ app.post("/", async (req, res) => {
   }
 });
 
-// GAS 연결 테스트
+/* GAS 연결 테스트 */
 app.get("/test-gas", async (req, res) => {
   try {
     const resp = await fetch(process.env.GAS_INGEST_URL, {
@@ -2107,10 +2139,8 @@ app.get("/test-gas", async (req, res) => {
 });
 
 /* ────────────────────────────────────────────────────────────
-   9) DEV 라우트
+   13) DEV 라우트 (IS_DEV=true일 때만)
 ──────────────────────────────────────────────────────────── */
-const IS_DEV = true;
-
 if (IS_DEV) {
   app.get("/dev/test-video-status", async (req, res) => {
     const traceId = req.query.trace_id;
@@ -2218,29 +2248,58 @@ if (IS_DEV) {
 }
 
 /* ────────────────────────────────────────────────────────────
-   10) AutoPilot v1 — Plan → Produce 단일 루프
+   14) AutoPilot v1 — PlanQueue 수신 + Plan → Produce 루프
 ──────────────────────────────────────────────────────────── */
-const GAS_AUTOPILOT_URL = process.env.GAS_AUTOPILOT_URL;
-const AUTOPILOT_API_KEY = process.env.AUTOPILOT_API_KEY;
+// AutoPilot v1 – PlanQueue 실데이터 수신 + JobRow 생성
+app.post("/autopilot/planqueue", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const { secret, payload } = body;
 
-async function callAutopilotGAS(action, payload = {}) {
-  const res = await axios.post(GAS_AUTOPILOT_URL, {
-    action,
-    api_key: AUTOPILOT_API_KEY,
-    ...payload,
-  });
-  return res.data;
-}
+    if (!secret || secret !== AUTOPILOT_API_KEY) {
+      console.warn("[AUTOPILOT][PLANQUEUE] ❌ invalid secret");
+      return res.status(401).json({
+        ok: false,
+        error: "invalid_secret",
+      });
+    }
+
+    console.log(
+      "[AUTOPILOT][PLANQUEUE] ✅ received:",
+      JSON.stringify(payload, null, 2)
+    );
+
+    const job = await createJobFromPlanQueueRow(payload);
+
+    if (!job) {
+      console.warn("[AUTOPILOT][PLANQUEUE] ❌ job create 실패");
+      return res.status(500).json({
+        ok: false,
+        error: "job_create_failed",
+      });
+    }
+
+    console.log("[AUTOPILOT][PLANQUEUE] ✅ JobRow created:", job);
+
+    return res.status(200).json({
+      ok: true,
+      job,
+    });
+  } catch (err) {
+    console.error("[AUTOPILOT][PLANQUEUE] ❌ error:", err);
+    return res.status(500).json({
+      ok: false,
+      error: "server_error",
+      detail: err.message,
+    });
+  }
+});
 
 async function autopilotProduce(topic) {
   const prompt = `주제: ${topic}
 한 문단짜리 아주 짧은 테스트 스크립트를 작성해줘.`;
 
-  const openai = new OpenAI({
-    apiKey: OPENAI_API_KEY,
-  });
-
-  const r = await openai.chat.completions.create({
+  const r = await oa.chat.completions.create({
     model: OPENAI_MODEL_RESP,
     messages: [
       { role: "system", content: "테스트용 콘텐츠 생성기" },
@@ -2302,11 +2361,10 @@ app.post("/autopilot/run", async (req, res) => {
 });
 
 /* ────────────────────────────────────────────────────────────
-   11) 서버 시작
+   15) 서버 시작
 ──────────────────────────────────────────────────────────── */
-const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(
-    `🚀 Server is running on port ${PORT} (approval_mode=${APPROVAL_MODE})`
+    `🚀 Server is running on port ${PORT} (approval_mode=${APPROVAL_MODE}, IS_DEV=${IS_DEV})`
   );
 });
