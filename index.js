@@ -82,15 +82,18 @@ const handleTelegramWebhook = async (req, res) => {
 
     const newJob = await createJobFromPlanQueueRow(text, traceId, chatId);
 
-    if (!newJob.ok) {
+    // ✅ newJob 자체가 null/undefined 인 상황 방어
+    if (!newJob || !newJob.ok) {
+      console.error("[tg-webhook] createJobFromPlanQueueRow 반환값 이상:", newJob);
       await tgSend(chatId, "❌ 요청 처리 실패");
       return res.json({ ok: false });
     }
 
-    res.json({ ok: true });
+    return res.json({ ok: true });
+
   } catch (e) {
     console.error("tg-webhook error:", e);
-    res.json({ ok: false, error: e.message });
+    return res.json({ ok: false, error: e.message });
   }
 };
 
