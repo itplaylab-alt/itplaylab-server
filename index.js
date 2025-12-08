@@ -7,6 +7,7 @@ dotenv.config();
 import express from "express";
 import axios from "axios";
 import crypto from "crypto";
+import { runWorkerOnce } from "./src/worker.js";
 
 // ─────────────────────────────────────────
 //  공통 설정
@@ -44,7 +45,9 @@ app.use((req, res, next) => {
   if (req.path === "/next-job") {
     const now = Date.now();
     if (now - lastJobLogAt > 30000) {
-      console.log(`[JOBQUEUE] ${new Date().toISOString()} ${req.method} ${req.url}`);
+      console.log(
+        `[JOBQUEUE] ${new Date().toISOString()} ${req.method} ${req.url}`
+      );
       lastJobLogAt = now;
     }
     return next();
@@ -63,7 +66,6 @@ const nowISO = () => new Date().toISOString();
 // ─────────────────────────────────────────
 // 1) Telegram Webhook 처리
 // ─────────────────────────────────────────
-// 1) Telegram Webhook 처리
 const handleTelegramWebhook = async (req, res) => {
   const body = req.body;
 
@@ -84,13 +86,15 @@ const handleTelegramWebhook = async (req, res) => {
 
     // ✅ newJob 자체가 null/undefined 인 상황 방어
     if (!newJob || !newJob.ok) {
-      console.error("[tg-webhook] createJobFromPlanQueueRow 반환값 이상:", newJob);
+      console.error(
+        "[tg-webhook] createJobFromPlanQueueRow 반환값 이상:",
+        newJob
+      );
       await tgSend(chatId, "❌ 요청 처리 실패");
       return res.json({ ok: false });
     }
 
     return res.json({ ok: true });
-
   } catch (e) {
     console.error("tg-webhook error:", e);
     return res.json({ ok: false, error: e.message });
@@ -104,54 +108,36 @@ app.post("/telegram/webhook", handleTelegramWebhook);
 // ─────────────────────────────────────────
 // 2) Worker 전용 엔드포인트 (/next-job)
 // ─────────────────────────────────────────
-// 2) Worker 전용 엔드포인트 (/next-job)
 app.post("/next-job", async (req, res) => {
+  // 1. 시크릿 검사
   const secret = req.query.secret || "";
   const expected = CONFIG.JOBQUEUE_WORKER_SECRET || "";
 
-  // 1. 시크릿 검사
   if (!expected || secret !== expected) {
     console.error("[NEXT-JOB] ❌ UNAUTHORIZED_WORKER", {
       expected: expected && expected.slice(0, 4),
       got: secret && secret.slice(0, 4),
     });
-    return res.status(403).json({ ok: false, error: "UNAUTHORIZED_WORKER" });
+    return res
+      .status(403)
+      .json({ ok: false, error: "UNAUTHORIZED_WORKER" });
   }
 
   try {
-    // 2. 다음 작업 하나 가져오기 (기존 로직 그대로 사용)
-    const job = await findByTraceId(null, { getNext: true });
+    // 2. Worker 한 번 실행
+    const result = await runWorkerOnce();
 
-    if (!job) {
-      // 2-1. 대기 중인 작업 없음
-      return res.json({
-        ok: true,
-        has_job: false,
-        job: null,
-        message: "no_pending_job",
-      });
+    if (!result) {
+      return res.json({ ok: false, message: "No job or error" });
     }
 
-    // 2-2. 작업이 있는 경우 → 워커에게 넘겨줄 최소 정보만 전달
-    const payload = {
-      id: job.id,
-      trace_id: job.trace_id,
-      type: job.type,
-      params: job.params,
-    };
-
-    return res.json({
-      ok: true,
-      has_job: true,
-      job: payload,
-      message: "job_acquired",
-    });
+    // 3. 성공 응답
+    return res.json({ ok: true, result });
   } catch (e) {
     console.error("[NEXT-JOB] 🧨 error:", e);
-    return res.status(500).json({
-      ok: false,
-      error: e?.message || "INTERNAL_ERROR",
-    });
+    return res
+      .status(500)
+      .json({ ok: false, error: e?.message || "INTERNAL_ERROR" });
   }
 });
 
