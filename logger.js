@@ -4,7 +4,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 
-// ESM에서는 __dirname이 없기 때문에 직접 생성
+// ESM에서 __dirname 생성
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -18,7 +18,7 @@ if (!fs.existsSync(LOG_DIR)) {
   fs.mkdirSync(LOG_DIR, { recursive: true });
 }
 
-// 한 줄씩 파일로 저장하는 함수
+// 파일에 한 줄씩 저장하는 함수
 function writeLine(line) {
   fs.appendFile(LOG_PATH, line + "\n", "utf8", (err) => {
     if (err) {
@@ -27,16 +27,16 @@ function writeLine(line) {
   });
 }
 
-// 이벤트(로그 오브젝트) 구조 만들기
+// 이벤트(로그) 오브젝트 작성 함수
 function buildEvent(event = {}) {
   return {
-    ts: new Date().toISOString(), // 타임스탬프 자동 포함
-    ok: true,                      // 기본 ok:true
+    ts: new Date().toISOString(), // 타임스탬프
+    ok: true,                     // 기본값
     ...event,
   };
 }
 
-// 정상 로그 기록용 함수
+// 정상 로그 기록
 function logEvent(event) {
   const payload = buildEvent(event);
   const line = JSON.stringify(payload);
@@ -47,7 +47,7 @@ function logEvent(event) {
   return payload;
 }
 
-// 에러 로그 기록용 함수
+// 에러 로그 기록
 function logError(event) {
   return logEvent({ ok: false, ...event });
 }
