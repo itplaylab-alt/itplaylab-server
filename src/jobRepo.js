@@ -5,7 +5,29 @@
 
 import axios from "axios";
 import { createClient } from "@supabase/supabase-js";
-import { logEvent, logError } from "../logger.js"; // 위치에 따라 ../ 또는 ./ 로 조정
+import { logEvent, logError } from "../logger.js";   // 상대경로는 프로젝트 기준으로 그대로 OK
+
+// ───────────────────────────────────
+// Supabase 초기화
+// ───────────────────────────────────
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY
+);
+
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
+  logError({
+    event: "jobRepo_init_supabase_fail",
+    error_message: "환경변수 SUPABASE_URL 또는 SUPABASE_SERVICE_KEY 없음",
+  });
+} else {
+  logEvent({
+    event: "jobRepo_init_supabase_ok",
+    ok: true,
+  });
+}
+
 
 // ─────────────────────────────────────
 // GAS WebApp (기존 로직)
