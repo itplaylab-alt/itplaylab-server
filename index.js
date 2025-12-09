@@ -3,12 +3,12 @@
 
 import dotenv from "dotenv";
 dotenv.config();
-
-import 'dotenv/config';
+import "dotenv/config";
 
 import express from "express";
 import axios from "axios";
 import crypto from "crypto";
+import { createClient } from "@supabase/supabase-js";
 import { runWorkerOnce } from "./src/worker.js";
 
 // ─────────────────────────────────────────
@@ -34,6 +34,16 @@ import {
 
 // 비디오 생성기
 import { startVideoGeneration } from "./src/videoFactoryClient.js";
+
+// ─────────────────────────────────────────
+// Supabase 클라이언트 (job_queue용)
+// ─────────────────────────────────────────
+// 이미 다른 곳에서 createClient 쓰고 있더라도, 여기서 한 번 더 만들어도 무방함.
+// 필요하면 CONFIG.SUPABASE_URL / CONFIG.SUPABASE_SERVICE_ROLE_KEY 로 바꿔써도 됨.
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
 // ─────────────────────────────────────────
 // 서버 준비
@@ -108,7 +118,59 @@ app.post("/tg-webhook", handleTelegramWebhook);
 app.post("/telegram/webhook", handleTelegramWebhook);
 
 // ─────────────────────────────────────────
-// 2) Worker 전용 엔드포인트 (/next-job)
+// 2) GAS / 외부에서 job 넣는 엔드포인트 (/enqueue-job)
+// ─────────────────────────────────────────
+app.post("/enqueue-job", async (req, res) => {
+  const secret = req.query.secret || "";
+  const expected = CONFIG.JOBQUEUE_ENQUEUE_SECRET || "";
+
+  if (!expected || secret !== expected) {
+    console.error("[ENQUEUE-JOB] ❌ UNAUTHORIZED_ENQUEUER", {
+      expected: expected && expected.slice(0, 4),
+      got: secret && secret.slice(0, 4),
+    });
+    return res
+      .status(403)
+      .json({ ok: false, error: "UNAUTHORIZED_ENQUEUER" });
+  }
+
+  try {
+    const { type = "test", payload = {}, chat_id = null, trace_id } =
+      req.body || {};
+
+    const now = nowISO();
+    const finalTraceId = trace_id || genTraceId();
+
+    const { data, error } = await supabase
+      .from("job_queue")
+      .insert({
+        status: "PENDING",
+        type,
+        params: payload,
+        chat_id,
+        trace_id: finalTraceId,
+        created_at: now,
+        updated_at: now,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      console.error("[ENQUEUE-JOB] DB_ERROR", error);
+      return res.status(500).json({ ok: false, error: "DB_ERROR" });
+    }
+
+    return res.json({ ok: true, job: data });
+  } catch (e) {
+    console.error("[ENQUEUE-JOB] INTERNAL_ERROR", e);
+    return res
+      .status(500)
+      .json({ ok: false, error: e?.message || "INTERNAL_ERROR" });
+  }
+});
+
+// ─────────────────────────────────────────
+// 3) Worker 전용 엔드포인트 (/next-job)
 // ─────────────────────────────────────────
 app.post("/next-job", async (req, res) => {
   // 1. 시크릿 검사
@@ -144,7 +206,7 @@ app.post("/next-job", async (req, res) => {
 });
 
 // ─────────────────────────────────────────
-// 3) 비디오 생성 완료 Webhook (VideoFactory)
+// 4) 비디오 생성 완료 Webhook (VideoFactory)
 // ─────────────────────────────────────────
 app.post("/video/result", async (req, res) => {
   const body = req.body;
