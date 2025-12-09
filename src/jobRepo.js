@@ -1,10 +1,15 @@
 // src/jobRepo.js
 // Google Apps Script Web App(GAS_WEB_URL)과 통신해서
 // CONTENT_LOG / PlanQueue 기반 JobRow를 조회·생성·업데이트하는 레포지토리
+// + Supabase job_queue 에서 Worker용 Job POP
 
 import axios from "axios";
+import { createClient } from "@supabase/supabase-js";
 import { logEvent, logError } from "../logger.js"; // 위치에 따라 ../ 또는 ./ 로 조정
 
+// ─────────────────────────────────────
+// GAS WebApp (기존 로직)
+// ─────────────────────────────────────
 const GAS_WEB_URL = process.env.GAS_INGEST_URL;
 // 예: https://script.google.com/macros/s/xxxx/exec
 
@@ -13,6 +18,28 @@ if (!GAS_WEB_URL) {
     event: "jobRepo_init_no_gas_url",
     ok: false,
     message: "GAS_INGEST_URL 환경변수가 없습니다!",
+  });
+}
+
+// ─────────────────────────────────────
+// Supabase (job_queue용)
+// ─────────────────────────────────────
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+
+let supabase = null;
+
+if (SUPABASE_URL && SUPABASE_SERVICE_KEY) {
+  supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+  logEvent({
+    event: "jobRepo_init_supabase_ok",
+    ok: true,
+  });
+} else {
+  logEvent({
+    event: "jobRepo_init_supabase_missing_env",
+    ok: false,
+    message: "SUPABASE_URL 또는 SUPABASE_SERVICE_KEY 가 없습니다.",
   });
 }
 
@@ -198,29 +225,87 @@ export async function updateVideoStatus(traceId, updates = {}) {
 }
 
 /* ============================================================================
- * Worker용 JobQueue POP (임시 버전)
+ * Worker용 JobQueue POP (Supabase job_queue)
  * ========================================================================== */
 
 /**
- * Render Background Worker가 /next-job 으로 요청할 때
- * '대기 중인 다음 Job 1건' 을 가져오는 함수 (임시 구현)
+ * Supabase job_queue 에서
+ *   - status = 'PENDING'
+ *   - locked_at IS NULL
+ * 인 Job 하나를 골라
+ *   - status = 'RUNNING'
+ *   - locked_at / locked_by / updated_at 갱신하고
+ * 그 레코드를 반환한다.
  *
- * @param {object} meta - worker_id 등 메타정보 (현재는 사용하지 않음)
- * @returns {object|null} job - 대기 Job이 없으면 null
+ * @param {string} workerId - 이 Job을 가져간 워커 ID (locked_by 에 기록)
+ * @returns {object|null}   - Job 레코드 1건, 없으면 null
  */
-export async function popNextJobForWorker(meta = {}) {
-  // TODO: 나중에 GAS WebApp 쪽에
-  //   action=popNextJobForWorker 같은 엔드포인트를 만들고,
-  //   실제로 JobQueue에서 1건을 pop 해서 반환하도록 구현하면 됨.
-  //
-  // 현재는 "대기 Job 없음"만 표현하기 위해 null을 반환하는 스텁이다.
+export async function popNextJobForWorker(workerId = "itplaylab-worker-1") {
+  if (!supabase) {
+    logError({
+      event: "jobRepo_popNextJobForWorker_no_supabase",
+      error_message: "Supabase 클라이언트가 초기화되지 않았습니다.",
+    });
+    return null;
+  }
+
+  const now = new Date().toISOString();
+
+  const { data, error } = await supabase
+    .from("job_queue")
+    .update({
+      status: "RUNNING",
+      locked_at: now,
+      locked_by: workerId,
+      updated_at: now,
+    })
+    .eq("status", "PENDING")
+    .is("locked_at", null)
+    .order("created_at", { ascending: true })
+    .limit(1)
+    .select()
+    .single();
+
+  // 매칭되는 Job 이 없는 경우
+  if (error) {
+    // PostgREST 에서 "0 rows" 일 때 자주 나오는 코드 / 메시지
+    if (
+      error.code === "PGRST116" ||
+      (error.details && error.details.includes("0 rows"))
+    ) {
+      logEvent({
+        event: "jobRepo_popNextJobForWorker_no_job",
+        ok: true,
+        note: "대기 Job 없음",
+      });
+      return null;
+    }
+
+    logError({
+      event: "jobRepo_popNextJobForWorker_error",
+      error_message: error.message || String(error),
+    });
+    throw error;
+  }
+
+  if (!data) {
+    logEvent({
+      event: "jobRepo_popNextJobForWorker_no_data",
+      ok: true,
+      note: "select 결과가 비어 있음",
+    });
+    return null;
+  }
 
   logEvent({
-    event: "jobRepo_popNextJobForWorker_stub",
+    event: "jobRepo_popNextJobForWorker_ok",
     ok: true,
-    meta,
-    note: "현재는 스텁 구현 (항상 null 반환)",
+    meta: {
+      id: data.id,
+      trace_id: data.trace_id,
+      type: data.type,
+    },
   });
 
-  return null;
+  return data;
 }
