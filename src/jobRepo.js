@@ -8,23 +8,24 @@ import { createClient } from "@supabase/supabase-js";
 import { logEvent, logError } from "../logger.js";
 
 // ───────────────────────────────────
-// Supabase 초기화
+// Supabase (job_queue용) 초기화
 // ───────────────────────────────────
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY
-);
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 
-if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
-  logError({
-    event: "jobRepo_init_supabase_fail",
-    error_message: "환경변수 SUPABASE_URL 또는 SUPABASE_SERVICE_KEY 없음",
-  });
-} else {
+let supabase = null;
+
+if (SUPABASE_URL && SUPABASE_SERVICE_KEY) {
+  supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
   logEvent({
     event: "jobRepo_init_supabase_ok",
     ok: true,
+  });
+} else {
+  logError({
+    event: "jobRepo_init_supabase_missing_env",
+    error_message: "SUPABASE_URL 또는 SUPABASE_SERVICE_KEY 가 없습니다.",
   });
 }
 
@@ -39,28 +40,6 @@ if (!GAS_WEB_URL) {
     event: "jobRepo_init_no_gas_url",
     ok: false,
     message: "GAS_INGEST_URL 환경변수가 없습니다!",
-  });
-}
-
-// ─────────────────────────────────────
-// Supabase (job_queue용)
-// ─────────────────────────────────────
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
-
-let supabase = null;
-
-if (SUPABASE_URL && SUPABASE_SERVICE_KEY) {
-  supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
-  logEvent({
-    event: "jobRepo_init_supabase_ok",
-    ok: true,
-  });
-} else {
-  logEvent({
-    event: "jobRepo_init_supabase_missing_env",
-    ok: false,
-    message: "SUPABASE_URL 또는 SUPABASE_SERVICE_KEY 가 없습니다.",
   });
 }
 
@@ -261,41 +240,87 @@ export async function updateVideoStatus(traceId, updates = {}) {
  * @param {string} workerId - 이 Job을 가져간 워커 ID (locked_by 에 기록)
  * @returns {object|null}   - Job 레코드 1건, 없으면 null
  */
-export async function popNextJobForWorker(meta = {}) {
+export async function popNextJobForWorker(
+  workerId = "itplaylab-worker-1"
+) {
+  if (!supabase) {
+    logError({
+      event: "jobRepo_popNextJobForWorker_no_supabase",
+      error_message: "Supabase 클라이언트가 초기화되지 않았습니다.",
+      worker_id: workerId,
+    });
+    return null;
+  }
+
+  const now = new Date().toISOString();
+
   try {
-    // GAS WebApp 에 popNextJobForWorker 요청 보내기
-    const url = `${GAS_WEB_URL}?action=popNextJobForWorker`;
+    const { data, error } = await supabase
+      .from("job_queue")
+      .update({
+        status: "RUNNING",
+        locked_at: now,
+        locked_by: workerId,
+        updated_at: now,
+      })
+      .eq("status", "PENDING")
+      .is("locked_at", null)
+      .order("created_at", { ascending: true })
+      .limit(1)
+      .select()
+      .single();
 
-    const res = await axios.get(url);
+    // 매칭되는 Job 이 없는 경우 (0 rows)
+    if (error) {
+      if (
+        error.code === "PGRST116" ||
+        (error.details && error.details.includes("0 rows"))
+      ) {
+        logEvent({
+          event: "jobRepo_popNextJobForWorker_no_job",
+          ok: true,
+          worker_id: workerId,
+          note: "대기 Job 없음",
+        });
+        return null;
+      }
 
-    if (!res.data || !res.data.ok || !res.data.job) {
+      logError({
+        event: "jobRepo_popNextJobForWorker_error",
+        worker_id: workerId,
+        error_message: error.message || String(error),
+      });
+      throw error;
+    }
+
+    if (!data) {
       logEvent({
-        event: "jobRepo_popNextJobForWorker_no_job",
+        event: "jobRepo_popNextJobForWorker_no_data",
         ok: true,
-        meta,
-        note: "대기 Job 없음",
+        worker_id: workerId,
+        note: "select 결과가 비어 있음",
       });
       return null;
     }
 
-    const job = res.data.job;
-
     logEvent({
       event: "jobRepo_popNextJobForWorker_ok",
       ok: true,
-      meta,
-      trace_id: job.trace_id,
-      job_type: job.type,
+      worker_id: workerId,
+      meta: {
+        id: data.id,
+        trace_id: data.trace_id,
+        type: data.type,
+      },
     });
 
-    return job;
+    return data;
   } catch (e) {
     logError({
-      event: "jobRepo_popNextJobForWorker_error",
+      event: "jobRepo_popNextJobForWorker_exception",
+      worker_id: workerId,
       error_message: e?.message || String(e),
-      meta,
     });
-
     return null;
   }
 }
