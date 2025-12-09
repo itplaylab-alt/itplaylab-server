@@ -226,7 +226,7 @@ export async function updateVideoStatus(traceId, updates = {}) {
  * Worker용 JobQueue POP (Supabase job_queue)
  * ========================================================================== */
 
-
+/**
  * Supabase job_queue 에서
  *   - status = 'PENDING'
  *   - locked_at IS NULL
@@ -238,21 +238,22 @@ export async function updateVideoStatus(traceId, updates = {}) {
  * @param {string} workerId - 이 Job을 가져간 워커 ID (locked_by 에 기록)
  * @returns {object|null}   - Job 레코드 1건, 없으면 null
  */
-export async function popNextJobForWorker(workerId = "itplaylab-worker-1") {
+export async function popNextJobForWorker(
+  workerId = "itplaylab-worker-1"
+) {
   // Supabase 클라이언트가 초기화 안 되었을 때 방어 로직
   if (!supabase) {
     logError({
       event: "jobRepo_popNextJobForWorker_no_supabase",
-      error_message: "Supabase 클라이언트가 초기화되지 않았습니다.",
       worker_id: workerId,
+      error_message: "Supabase 클라이언트가 초기화되지 않았습니다.",
     });
     return null;
   }
 
-  const now = new Date().toISOString();
-
   try {
-    // 1) job_queue 에서 PENDING & locked_at IS NULL 인 가장 오래된 Job 1개를 RUNNING 으로 업데이트 + 반환
+    const now = new Date().toISOString();
+
     const { data, error } = await supabase
       .from("job_queue")
       .update({
@@ -268,9 +269,8 @@ export async function popNextJobForWorker(workerId = "itplaylab-worker-1") {
       .select()
       .single();
 
-    // 2) 매칭되는 Job 이 없는 경우 (PENDING Job 없음)
+    // 1) 에러인데 "0 rows" 케이스 (대기 Job 없음)
     if (error) {
-      // PostgREST 가 "0 rows" 일 때 자주 쓰는 코드 / 메시지 방어
       if (
         error.code === "PGRST116" ||
         (error.details && error.details.includes("0 rows"))
@@ -284,17 +284,17 @@ export async function popNextJobForWorker(workerId = "itplaylab-worker-1") {
         return null;
       }
 
-      // 그 외 에러는 실제 에러로 처리
+      // 2) 진짜 에러
       logError({
         event: "jobRepo_popNextJobForWorker_error",
         worker_id: workerId,
         error_message: error.message || String(error),
       });
-      throw error;
+      return null;
     }
 
+    // 3) data 자체가 비어 있는 경우
     if (!data) {
-      // data 가 비어 있는 경우도 방어
       logEvent({
         event: "jobRepo_popNextJobForWorker_no_data",
         ok: true,
@@ -304,17 +304,14 @@ export async function popNextJobForWorker(workerId = "itplaylab-worker-1") {
       return null;
     }
 
-    // 3) 정상적으로 Job 하나를 가져온 경우
+    // 4) 정상적으로 Job 하나 가져온 경우 로그
     logEvent({
       event: "jobRepo_popNextJobForWorker_ok",
       ok: true,
       worker_id: workerId,
-      meta: {
-        id: data.id,
-        trace_id: data.trace_id,
-        type: data.type,
-        status: data.status,
-      },
+      id: data.id,
+      trace_id: data.trace_id,
+      type: data.type,
     });
 
     return data;
