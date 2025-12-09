@@ -226,7 +226,7 @@ export async function updateVideoStatus(traceId, updates = {}) {
  * Worker용 JobQueue POP (Supabase job_queue)
  * ========================================================================== */
 
-/**
+
  * Supabase job_queue 에서
  *   - status = 'PENDING'
  *   - locked_at IS NULL
