@@ -14,6 +14,9 @@ import { logEvent, logError } from "../logger.js";
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 
+// 전역 supabase 인스턴스 (중복 선언 금지!)
+let supabase = null;
+
 if (SUPABASE_URL && SUPABASE_SERVICE_KEY) {
   supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
   logEvent({
@@ -23,7 +26,8 @@ if (SUPABASE_URL && SUPABASE_SERVICE_KEY) {
 } else {
   logError({
     event: "jobRepo_init_supabase_missing_env",
-    error_message: "SUPABASE_URL 또는 SUPABASE_SERVICE_KEY 가 없습니다.",
+    ok: false,
+    message: "SUPABASE_URL 또는 SUPABASE_SERVICE_KEY 없음",
   });
 }
 
