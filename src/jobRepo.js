@@ -240,72 +240,41 @@ export async function updateVideoStatus(traceId, updates = {}) {
  * @param {string} workerId - 이 Job을 가져간 워커 ID (locked_by 에 기록)
  * @returns {object|null}   - Job 레코드 1건, 없으면 null
  */
-export async function popNextJobForWorker(workerId = "itplaylab-worker-1") {
-  if (!supabase) {
-    logError({
-      event: "jobRepo_popNextJobForWorker_no_supabase",
-      error_message: "Supabase 클라이언트가 초기화되지 않았습니다.",
-    });
-    return null;
-  }
+export async function popNextJobForWorker(meta = {}) {
+  try {
+    // GAS WebApp 에 popNextJobForWorker 요청 보내기
+    const url = `${GAS_WEB_URL}?action=popNextJobForWorker`;
 
-  const now = new Date().toISOString();
+    const res = await axios.get(url);
 
-  const { data, error } = await supabase
-    .from("job_queue")
-    .update({
-      status: "RUNNING",
-      locked_at: now,
-      locked_by: workerId,
-      updated_at: now,
-    })
-    .eq("status", "PENDING")
-    .is("locked_at", null)
-    .order("created_at", { ascending: true })
-    .limit(1)
-    .select()
-    .single();
-
-  // 매칭되는 Job 이 없는 경우
-  if (error) {
-    // PostgREST 에서 "0 rows" 일 때 자주 나오는 코드 / 메시지
-    if (
-      error.code === "PGRST116" ||
-      (error.details && error.details.includes("0 rows"))
-    ) {
+    if (!res.data || !res.data.ok || !res.data.job) {
       logEvent({
         event: "jobRepo_popNextJobForWorker_no_job",
         ok: true,
+        meta,
         note: "대기 Job 없음",
       });
       return null;
     }
 
+    const job = res.data.job;
+
+    logEvent({
+      event: "jobRepo_popNextJobForWorker_ok",
+      ok: true,
+      meta,
+      trace_id: job.trace_id,
+      job_type: job.type,
+    });
+
+    return job;
+  } catch (e) {
     logError({
       event: "jobRepo_popNextJobForWorker_error",
-      error_message: error.message || String(error),
+      error_message: e?.message || String(e),
+      meta,
     });
-    throw error;
-  }
 
-  if (!data) {
-    logEvent({
-      event: "jobRepo_popNextJobForWorker_no_data",
-      ok: true,
-      note: "select 결과가 비어 있음",
-    });
     return null;
   }
-
-  logEvent({
-    event: "jobRepo_popNextJobForWorker_ok",
-    ok: true,
-    meta: {
-      id: data.id,
-      trace_id: data.trace_id,
-      type: data.type,
-    },
-  });
-
-  return data;
 }
