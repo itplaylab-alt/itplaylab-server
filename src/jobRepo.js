@@ -5,7 +5,7 @@
 
 import axios from "axios";
 import { createClient } from "@supabase/supabase-js";
-import { logEvent, logError } from "../logger.js";   // 상대경로는 프로젝트 기준으로 그대로 OK
+import { logEvent, logError } from "../logger.js";
 
 // ───────────────────────────────────
 // Supabase 초기화
@@ -27,7 +27,6 @@ if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
     ok: true,
   });
 }
-
 
 // ─────────────────────────────────────
 // GAS WebApp (기존 로직)
