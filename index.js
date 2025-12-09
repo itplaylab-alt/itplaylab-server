@@ -15,6 +15,7 @@ import { runWorkerOnce } from "./src/worker.js";
 //  공통 설정
 // ─────────────────────────────────────────
 import { CONFIG } from "./lib/config.js";
+console.log("[DEBUG] ENQUEUE_SECRET =", process.env.JOBQUEUE_ENQUEUE_SECRET);
 
 // 서비스 계층
 import { logToSheet } from "./services/gasLogger.js";
