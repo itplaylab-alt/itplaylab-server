@@ -189,15 +189,20 @@ app.post("/next-job", async (req, res) => {
   }
 
   try {
-    // 2. Worker 한 번 실행
+    // 2. Worker 한 번 실행 → 다음 Job 가져오기
     const result = await runWorkerOnce();
 
-    if (!result) {
-      return res.json({ ok: false, message: "No job or error" });
+    // Job 이 없을 때: ok:true, has_job:false
+    if (!result || !result.has_job || !result.job) {
+      return res.json({ ok: true, has_job: false });
     }
 
-    // 3. 성공 응답
-    return res.json({ ok: true, result });
+    // 3. Job 이 있을 때: ok:true, has_job:true, job:{...}
+    return res.json({
+      ok: true,
+      has_job: true,
+      job: result.job,
+    });
   } catch (e) {
     console.error("[NEXT-JOB] 🧨 error:", e);
     return res
