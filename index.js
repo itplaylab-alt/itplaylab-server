@@ -6,7 +6,6 @@ dotenv.config();
 import "dotenv/config";
 
 import express from "express";
-import axios from "axios";
 import crypto from "crypto";
 import { createClient } from "@supabase/supabase-js";
 import { runWorkerOnce } from "./src/worker.js";
@@ -31,9 +30,6 @@ import {
   findByTraceId,
   updateVideoStatus,
   createJobFromPlanQueueRow,
-  updateJobQueueStatus,
-  markJobDone,
-  markJobFailed,
 } from "./src/jobRepo.js";
 
 // 비디오 생성기
@@ -215,67 +211,7 @@ app.post("/next-job", async (req, res) => {
 });
 
 // ─────────────────────────────────────────
-// 4) Worker 완료 상태 업데이트 (/update-job-status)
-//    → job_queue.status 를 DONE / FAILED 등으로 갱신
-// ─────────────────────────────────────────
-app.post("/update-job-status", async (req, res) => {
-  // /next-job 과 동일한 워커 시크릿 사용
-  const secret = req.query.secret || "";
-  const expected = CONFIG.JOBQUEUE_WORKER_SECRET || "";
-
-  if (!expected || secret !== expected) {
-    console.error("[UPDATE-JOB-STATUS] ❌ UNAUTHORIZED_WORKER", {
-      expected: expected && expected.slice(0, 4),
-      got: secret && secret.slice(0, 4),
-    });
-    return res
-      .status(403)
-      .json({ ok: false, error: "UNAUTHORIZED_WORKER" });
-  }
-
-  try {
-    const { job_id, status, error_message, extra = {} } = req.body || {};
-
-    if (!job_id) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "MISSING_JOB_ID" });
-    }
-
-    let updated = null;
-
-    if (status === "DONE") {
-      updated = await markJobDone(job_id, extra);
-    } else if (status === "FAILED") {
-      updated = await markJobFailed(job_id, error_message, extra);
-    } else if (status) {
-      // 기타 상태값(e.g. RETRYING 등)을 직접 세팅하고 싶을 때
-      updated = await updateJobQueueStatus(job_id, {
-        status,
-        ...extra,
-      });
-    } else {
-      // status 없이 추가 필드만 업데이트 하려는 경우
-      updated = await updateJobQueueStatus(job_id, extra);
-    }
-
-    if (!updated) {
-      return res
-        .status(500)
-        .json({ ok: false, error: "UPDATE_FAILED" });
-    }
-
-    return res.json({ ok: true, job: updated });
-  } catch (e) {
-    console.error("[UPDATE-JOB-STATUS] 🧨 error:", e);
-    return res
-      .status(500)
-      .json({ ok: false, error: e?.message || "INTERNAL_ERROR" });
-  }
-});
-
-// ─────────────────────────────────────────
-// 5) 비디오 생성 완료 Webhook (VideoFactory)
+// 4) 비디오 생성 완료 Webhook (VideoFactory)
 // ─────────────────────────────────────────
 app.post("/video/result", async (req, res) => {
   const body = req.body;
