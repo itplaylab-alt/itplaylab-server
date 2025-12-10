@@ -504,17 +504,3 @@ export async function markJobFailed(jobId, reason = null, extraUpdates = {}) {
   });
 }
 
-// ─────────────────────────────────────
-// 명시적 export 묶음 (ESM named export 확실히 보이도록)
-// ─────────────────────────────────────
-export {
-  // GAS 관련
-  findByTraceId,
-  createJobFromPlanQueueRow,
-  updateVideoStatus,
-  // JobQueue 관련
-  popNextJobForWorker,
-  updateJobQueueStatus,
-  markJobDone,
-  markJobFailed,
-};
