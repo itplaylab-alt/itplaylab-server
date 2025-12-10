@@ -8,7 +8,8 @@ import {
   markJobFailed,
 } from "./jobRepo.js";
 
-const DEFAULT_WORKER_ID = process.env.WORKER_ID || "itplaylab-worker-1";
+const DEFAULT_WORKER_ID =
+  process.env.WORKER_ID || "itplaylab-worker-1";
 
 export async function runWorkerOnce() {
   try {
