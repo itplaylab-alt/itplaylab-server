@@ -228,16 +228,16 @@ export async function updateVideoStatus(traceId, updates = {}) {
 
 /* ============================================================================
  * Worker용 JobQueue POP (Supabase job_queue)
- * ========================================================================== */
+ * ========================================================================= */
 
 /**
  * Supabase job_queue 에서
  *   - status = 'PENDING'
  *   - locked_at IS NULL
- * 인 Job 하나를 골라
+ * 인 Job 하나를 조회한 뒤,
  *   - status = 'RUNNING'
- *   - locked_at / locked_by / updated_at 갱신하고
- * 그 레코드를 반환한다.
+ *   - locked_at / locked_by / updated_at 를 갱신하고
+ * 해당 레코드를 반환한다.
  *
  * @param {string} workerId - 이 Job을 가져간 워커 ID (locked_by 에 기록)
  * @returns {object|null}   - Job 레코드 1건, 없으면 null
@@ -258,7 +258,86 @@ export async function popNextJobForWorker(
   try {
     const now = new Date().toISOString();
 
-    const { data, error } = await supabase
+    // ────────────────────────────────────
+    // 0) 디버그용: PENDING + unlocked 개수 로깅
+    // ────────────────────────────────────
+    const {
+      count: pendingCount,
+      error: countError,
+    } = await supabase
+      .from("job_queue")
+      .select("*", { count: "exact", head: true })
+      .eq("status", "PENDING")
+      .is("locked_at", null);
+
+    if (countError) {
+      logError({
+        event: "jobRepo_popNextJobForWorker_count_error",
+        worker_id: workerId,
+        error_message: countError.message || String(countError),
+      });
+    } else {
+      logEvent({
+        event: "jobRepo_popNextJobForWorker_pending_count",
+        ok: true,
+        worker_id: workerId,
+        pending_count: pendingCount ?? 0,
+      });
+    }
+
+    // ────────────────────────────────────
+    // 1) 가장 오래된 PENDING + unlocked Job 1건 조회
+    // ────────────────────────────────────
+    const {
+      data: candidate,
+      error: selectError,
+    } = await supabase
+      .from("job_queue")
+      .select("*")
+      .eq("status", "PENDING")
+      .is("locked_at", null)
+      .order("created_at", { ascending: true, nullsFirst: true })
+      .limit(1)
+      .maybeSingle(); // supabase-js v2 기준
+
+    if (selectError) {
+      logError({
+        event: "jobRepo_popNextJobForWorker_select_error",
+        worker_id: workerId,
+        error_message: selectError.message || String(selectError),
+      });
+      return null;
+    }
+
+    // 조회된 후보 Job 이 없는 경우 (대기 Job 없음)
+    if (!candidate) {
+      logEvent({
+        event: "jobRepo_popNextJobForWorker_no_job",
+        ok: true,
+        worker_id: workerId,
+        note: "대기 Job 없음 (PENDING + locked_at IS NULL 조건 불일치)",
+      });
+      return null;
+    }
+
+    logEvent({
+      event: "jobRepo_popNextJobForWorker_candidate_found",
+      ok: true,
+      worker_id: workerId,
+      id: candidate.id,
+      status: candidate.status,
+      locked_at: candidate.locked_at,
+      created_at: candidate.created_at,
+      type: candidate.type,
+    });
+
+    // ────────────────────────────────────
+    // 2) 해당 Job 을 RUNNING 으로 락 (경쟁 상황 방지 조건 포함)
+    // ────────────────────────────────────
+    const {
+      data: locked,
+      error: lockError,
+    } = await supabase
       .from("job_queue")
       .update({
         status: "RUNNING",
@@ -266,59 +345,45 @@ export async function popNextJobForWorker(
         locked_by: workerId,
         updated_at: now,
       })
-      .eq("status", "PENDING")
-      .is("locked_at", null)
-      .order("created_at", { ascending: true })
-      .limit(1)
+      .eq("id", candidate.id)
+      .eq("status", "PENDING")   // 여전히 PENDING인지 확인
+      .is("locked_at", null)     // 여전히 unlock 상태인지 확인
       .select()
-      .single();
+      .maybeSingle();
 
-    // 1) 에러인데 "0 rows" 케이스 (대기 Job 없음)
-    if (error) {
-      if (
-        error.code === "PGRST116" ||
-        (error.details && error.details.includes("0 rows"))
-      ) {
-        logEvent({
-          event: "jobRepo_popNextJobForWorker_no_job",
-          ok: true,
-          worker_id: workerId,
-          note: "대기 Job 없음",
-        });
-        return null;
-      }
-
-      // 2) 진짜 에러
+    if (lockError) {
       logError({
-        event: "jobRepo_popNextJobForWorker_error",
+        event: "jobRepo_popNextJobForWorker_lock_error",
         worker_id: workerId,
-        error_message: error.message || String(error),
+        error_message: lockError.message || String(lockError),
+        id: candidate.id,
       });
       return null;
     }
 
-    // 3) data 자체가 비어 있는 경우
-    if (!data) {
+    // 업데이트 결과가 없으면: 다른 Worker 가 선점한 상황
+    if (!locked) {
       logEvent({
-        event: "jobRepo_popNextJobForWorker_no_data",
+        event: "jobRepo_popNextJobForWorker_lock_lost",
         ok: true,
         worker_id: workerId,
-        note: "select 결과가 비어 있음",
+        id: candidate.id,
+        note: "다른 worker 가 먼저 Job 을 락함",
       });
       return null;
     }
 
-    // 4) 정상적으로 Job 하나 가져온 경우 로그
+    // 정상적으로 Job 하나 가져온 경우 로그
     logEvent({
       event: "jobRepo_popNextJobForWorker_ok",
       ok: true,
       worker_id: workerId,
-      id: data.id,
-      trace_id: data.trace_id,
-      type: data.type,
+      id: locked.id,
+      trace_id: locked.trace_id,
+      type: locked.type,
     });
 
-    return data;
+    return locked;
   } catch (e) {
     logError({
       event: "jobRepo_popNextJobForWorker_exception",
