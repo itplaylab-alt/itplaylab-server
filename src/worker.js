@@ -11,7 +11,7 @@ import {
   markJobFailed,
 } from "./jobRepo.js";
 
-import { tgSend } from "../services/telegramBot.js"; // ✅ 작업 결과를 텔레그램으로 통지
+import { tgSend, tg2Send } from "../services/telegramBot.js";
 
 const DEFAULT_WORKER_ID = process.env.WORKER_ID || "itplaylab-worker-1";
 
@@ -24,6 +24,32 @@ const supabase = createClient(
 // ─────────────────────────────────────────
 // 유틸
 // ─────────────────────────────────────────
+function pickJobNamespace(job) {
+  return (
+    job?.params?.namespace ??
+    job?.params?.meta?.namespace ??
+    (job?.type === "it2_cmd" ? "it2" : "it1")
+  );
+}
+
+function pickJobChatId(job) {
+  return (
+    job?.params?.meta?.chat_id ??
+    job?.params?.meta?.chatId ??
+    job?.chat_id ??
+    null
+  );
+}
+
+async function notifyJob(job, text) {
+  const chatId = pickJobChatId(job);
+  if (!chatId) return;
+
+  const ns = pickJobNamespace(job);
+  return ns === "it2" ? tg2Send(chatId, text) : tgSend(chatId, text);
+}
+
+
 const nowISO = () => new Date().toISOString();
 const genRunId = () => `it2_${Date.now()}_${crypto.randomBytes(3).toString("hex")}`;
 
@@ -283,87 +309,68 @@ export async function runWorkerOnce() {
       })
     );
 
-    // 3) 실제 작업 처리
-    try {
-      let result = { ok: true };
+// 3) 실제 작업 처리
+try {
+  let result = { ok: true };
 
-      // ✅ 여기서 type 분기
-      if (job.type === "it2_cmd") {
-        result = await handleIt2Cmd(job);
-      } else {
-        // 기존(it1) 타입은 지금은 그대로 STUB 유지
-        result = { ok: true, note: "stub_done" };
-      }
-
-      const latency_ms = Date.now() - startedAt;
-
-      // 결과 로그(표준)
-      console.log(
-        "[LOG]",
-        JSON.stringify({
-          event: "worker.job_result",
-          ok: !!result.ok,
-          id: job.id,
-          trace_id: job.trace_id,
-          type: job.type,
-          latency_ms,
-          result,
-        })
-      );
-
-      if (result.ok) {
-        await markJobDone(job.id);
-
-        // ✅ 텔레그램 통지 (job.chat_id가 있을 때만)
-        if (job.chat_id) {
-          await tgSend(
-            job.chat_id,
-            `✅ 작업 완료\ntype: ${job.type}\ntrace_id: ${job.trace_id}\nlatency_ms: ${latency_ms}\n${result.skipped ? "(skipped)" : ""}`
-          );
-        }
-      } else {
-        await markJobFailed(job.id, result.error || "PROCESS_FAIL");
-
-        if (job.chat_id) {
-          await tgSend(
-            job.chat_id,
-            `❌ 작업 실패\ntype: ${job.type}\ntrace_id: ${job.trace_id}\nerror: ${result.error || "PROCESS_FAIL"}`
-          );
-        }
-      }
-    } catch (procErr) {
-      console.error(
-        "[LOG]",
-        JSON.stringify({
-          event: "worker.process_error",
-          ok: false,
-          id: job.id,
-          trace_id: job.trace_id,
-          type: job.type,
-          error: procErr?.message || String(procErr),
-        })
-      );
-
-      await markJobFailed(job.id, procErr?.message || String(procErr));
-
-      if (job.chat_id) {
-        await tgSend(
-          job.chat_id,
-          `❌ 작업 처리 중 예외\ntrace_id: ${job.trace_id}\n${procErr?.message || String(procErr)}`
-        );
-      }
-    }
-
-    return { has_job: true, job };
-  } catch (e) {
-    console.error(
-      "[LOG]",
-      JSON.stringify({
-        event: "worker.error",
-        ok: false,
-        error: e?.message || String(e),
-      })
-    );
-    throw e;
+  // ✅ 여기서 type 분기
+  if (job.type === "it2_cmd") {
+    result = await handleIt2Cmd(job);
+  } else {
+    // 기존(it1) 타입은 지금은 그대로 STUB 유지
+    result = { ok: true, note: "stub_done" };
   }
+
+  const latency_ms = Date.now() - startedAt;
+
+  // 결과 로그(표준)
+  console.log(
+    "[LOG]",
+    JSON.stringify({
+      event: "worker.job_result",
+      ok: !!result.ok,
+      id: job.id,
+      trace_id: job.trace_id,
+      type: job.type,
+      latency_ms,
+      result,
+    })
+  );
+
+  if (result.ok) {
+    await markJobDone(job.id);
+
+    await notifyJob(
+      job,
+      `✅ 작업 완료\ntype: ${job.type}\ntrace_id: ${job.trace_id}\nlatency_ms: ${latency_ms}${result?.skipped ? "\n(skipped)" : ""}`
+    );
+  } else {
+    await markJobFailed(job.id, result.error || "PROCESS_FAIL");
+
+    await notifyJob(
+      job,
+      `❌ 작업 실패\ntype: ${job.type}\ntrace_id: ${job.trace_id}\nerror: ${result.error || "PROCESS_FAIL"}`
+    );
+  }
+} catch (procErr) {
+  console.error(
+    "[LOG]",
+    JSON.stringify({
+      event: "worker.process_error",
+      ok: false,
+      id: job.id,
+      trace_id: job.trace_id,
+      type: job.type,
+      error: procErr?.message || String(procErr),
+    })
+  );
+
+  await markJobFailed(job.id, procErr?.message || String(procErr));
+
+  await notifyJob(
+    job,
+    `❌ 작업 처리 중 예외\ntrace_id: ${job.trace_id}\n${procErr?.message || String(procErr)}`
+  );
 }
+
+return { has_job: true, job };
