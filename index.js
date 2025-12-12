@@ -285,6 +285,8 @@ const handleTelegramWebhookIt2 = async (req, res) => {
     const chatId = body?.message?.chat?.id ?? null;
     const text = body?.message?.text ?? "";
 
+console.log("[IT2_WEBHOOK]", { hasMessage: !!body?.message, chatId, text, keys: Object.keys(body || {}) });
+    
     if (!chatId || !text) return res.json({ ok: true });
 
     const traceId = genTraceId();
