@@ -373,4 +373,17 @@ try {
   );
 }
 
-return { has_job: true, job };
+  return { has_job: true, job };
+} catch (e) {
+  console.error(
+    "[LOG]",
+    JSON.stringify({
+      event: "worker.error",
+      ok: false,
+      error: e?.message || String(e),
+    })
+  );
+  throw e;
+}
+}
+
