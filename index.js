@@ -16,7 +16,7 @@ import { runWorkerOnce } from "./src/worker.js";
 import { CONFIG } from "./lib/config.js";
 console.log("[DEBUG] ENQUEUE_SECRET =", process.env.JOBQUEUE_ENQUEUE_SECRET);
 
-// 서비스 계층
+// 서비스 계층 (it1 bot)
 import { logToSheet } from "./services/gasLogger.js";
 import {
   tgSend,
@@ -74,8 +74,33 @@ const genTraceId = () => `trc_${crypto.randomBytes(4).toString("hex")}`;
 const nowISO = () => new Date().toISOString();
 
 // ─────────────────────────────────────────
+// ✅ it2 전용 텔레그램 sender (별도 봇 토큰)
+//   - Render env: TELEGRAM_IT2_BOT_TOKEN 설정 필요
+// ─────────────────────────────────────────
+const IT2_BOT_TOKEN =
+  process.env.TELEGRAM_IT2_BOT_TOKEN || CONFIG.TELEGRAM_IT2_BOT_TOKEN || "";
+
+const tg2Api = (method) => `https://api.telegram.org/bot${IT2_BOT_TOKEN}/${method}`;
+
+async function tg2Send(chatId, text, extra = {}) {
+  if (!IT2_BOT_TOKEN) throw new Error("NO_TELEGRAM_IT2_BOT_TOKEN");
+  const resp = await fetch(tg2Api("sendMessage"), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text,
+      disable_web_page_preview: true,
+      ...extra,
+    }),
+  });
+  const json = await resp.json();
+  if (!json.ok) throw new Error(json.description || "TELEGRAM_IT2_SEND_FAILED");
+  return json;
+}
+
+// ─────────────────────────────────────────
 // ✅ 403 진단 라벨 유틸 (expected/got prefix)
-//  - 운영 중엔 prefix 길이를 줄이거나, 텔레그램 알림을 끄는 것도 고려
 // ─────────────────────────────────────────
 const mask4 = (v = "") => (v ? String(v).slice(0, 4) : "");
 const buildAuthDiag = ({ kind, expected, got }) => ({
@@ -212,81 +237,105 @@ async function enqueueJobToQueue({ type, payload, chat_id, trace_id }) {
 }
 
 // ─────────────────────────────────────────
-// 1) Telegram Webhook 처리
+// 1) Telegram Webhook 처리 (it1 전용 / it2 전용 분리)
 // ─────────────────────────────────────────
-const handleTelegramWebhook = async (req, res) => {
+const handleTelegramWebhookIt1 = async (req, res) => {
   const body = req.body;
 
   try {
     const chatId = body?.message?.chat?.id ?? null;
     const text = body?.message?.text ?? "";
 
-    if (!chatId || !text) {
-      return res.json({ ok: true });
-    }
+    if (!chatId || !text) return res.json({ ok: true });
 
     const traceId = genTraceId();
 
-    // 접수 알림(기존 유지)
-    if (shouldNotify("success"))
+    if (shouldNotify("success")) {
       await tgSend(chatId, `✅ 요청 접수\ntrace_id: ${traceId}`);
-
-    // ─────────────────────────────────────────
-    // ✅ it2 명령이면: 잇플랩2 전용 라우팅
-    // ─────────────────────────────────────────
-    if (text.trim().startsWith("/it2")) {
-      const parsed = buildIt2CommandPayload(text, {
-        trace_id: traceId,
-        chat_id: chatId,
-      });
-
-      if (!parsed.ok) {
-        await tgSend(chatId, `❌ it2 명령 오류: ${parsed.error}\n\n${parsed.hint}`);
-        return res.json({ ok: false, error: parsed.error });
-      }
-
-      const enq = await enqueueJobToQueue({
-        type: parsed.jobType, // "it2_cmd"
-        payload: parsed.payload, // {namespace, cmd, args...}
-        chat_id: chatId,
-        trace_id: traceId,
-      });
-
-      if (!enq.ok) {
-        await tgSend(chatId, `❌ it2 요청 enqueue 실패\ntrace_id: ${traceId}`);
-        return res.json({ ok: false, error: "ENQUEUE_FAILED" });
-      }
-
-      await tgSend(
-        chatId,
-        `🧠 it2 작업 접수 완료\ncmd: ${parsed.payload.cmd}\ntrace_id: ${traceId}`
-      );
-
-      return res.json({ ok: true });
     }
 
-    // ─────────────────────────────────────────
-    // ✅ it2가 아니면: 기존 잇플랩1 콘텐츠 파서 그대로
-    // ─────────────────────────────────────────
+    // it1: 기존 콘텐츠 파서만
     const newJob = await createJobFromPlanQueueRow(text, traceId, chatId);
 
-    // ✅ newJob 자체가 null/undefined 인 상황 방어
     if (!newJob || !newJob.ok) {
-      console.error("[tg-webhook] createJobFromPlanQueueRow 반환값 이상:", newJob);
+      console.error("[tg-it1] createJobFromPlanQueueRow 반환값 이상:", newJob);
       await tgSend(chatId, "❌ 요청 처리 실패");
       return res.json({ ok: false });
     }
 
     return res.json({ ok: true });
   } catch (e) {
-    console.error("tg-webhook error:", e);
+    console.error("tg-it1 webhook error:", e);
     return res.json({ ok: false, error: e.message });
   }
 };
 
-// 둘 다 같은 핸들러 사용
-app.post("/tg-webhook", handleTelegramWebhook);
-app.post("/telegram/webhook", handleTelegramWebhook);
+const handleTelegramWebhookIt2 = async (req, res) => {
+  const body = req.body;
+
+  try {
+    const chatId = body?.message?.chat?.id ?? null;
+    const text = body?.message?.text ?? "";
+
+    if (!chatId || !text) return res.json({ ok: true });
+
+    const traceId = genTraceId();
+
+    // it2 접수 알림은 it2 봇으로
+    await tg2Send(chatId, `✅ it2 요청 접수\ntrace_id: ${traceId}`);
+
+    // it2 봇에서는 "/it2" 없이 보내도 되게끔 자동 prefix
+    const normalized = text.trim();
+    const it2Text = normalized.startsWith("/it2") ? normalized : `/it2 ${normalized}`;
+
+    const parsed = buildIt2CommandPayload(it2Text, {
+      trace_id: traceId,
+      chat_id: chatId,
+    });
+
+    if (!parsed.ok) {
+      await tg2Send(chatId, `❌ it2 명령 오류: ${parsed.error}\n\n${parsed.hint}`);
+      return res.json({ ok: false, error: parsed.error });
+    }
+
+    const enq = await enqueueJobToQueue({
+      type: parsed.jobType,      // "it2_cmd"
+      payload: parsed.payload,   // {namespace, cmd, args...}
+      chat_id: chatId,
+      trace_id: traceId,
+    });
+
+    if (!enq.ok) {
+      await tg2Send(chatId, `❌ it2 요청 enqueue 실패\ntrace_id: ${traceId}`);
+      return res.json({ ok: false, error: "ENQUEUE_FAILED" });
+    }
+
+    await tg2Send(
+      chatId,
+      `🧠 it2 작업 접수 완료\ncmd: ${parsed.payload.cmd}\ntrace_id: ${traceId}`
+    );
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("tg-it2 webhook error:", e);
+    try {
+      const chatId = req.body?.message?.chat?.id;
+      if (chatId) await tg2Send(chatId, `❌ it2 처리 오류\n${e.message}`);
+    } catch {}
+    return res.json({ ok: false, error: e.message });
+  }
+};
+
+// ✅ 엔드포인트 분리
+app.post("/tg-webhook-it1", handleTelegramWebhookIt1);
+app.post("/telegram/webhook-it1", handleTelegramWebhookIt1);
+
+app.post("/tg-webhook-it2", handleTelegramWebhookIt2);
+app.post("/telegram/webhook-it2", handleTelegramWebhookIt2);
+
+// ✅ 하위호환: 기존 엔드포인트는 it1로 연결
+app.post("/tg-webhook", handleTelegramWebhookIt1);
+app.post("/telegram/webhook", handleTelegramWebhookIt1);
 
 // ─────────────────────────────────────────
 // 2) GAS / 외부에서 job 넣는 엔드포인트 (/enqueue-job)
@@ -320,7 +369,8 @@ app.post("/enqueue-job", async (req, res) => {
   }
 
   try {
-    const { type = "test", payload = {}, chat_id = null, trace_id } = req.body || {};
+    const { type = "test", payload = {}, chat_id = null, trace_id } =
+      req.body || {};
 
     const now = nowISO();
     const finalTraceId = trace_id || genTraceId();
