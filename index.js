@@ -38,8 +38,6 @@ import { startVideoGeneration } from "./src/videoFactoryClient.js";
 // ─────────────────────────────────────────
 // Supabase 클라이언트 (job_queue용)
 // ─────────────────────────────────────────
-// 이미 다른 곳에서 createClient 쓰고 있더라도, 여기서 한 번 더 만들어도 무방함.
-// 필요하면 CONFIG.SUPABASE_URL / CONFIG.SUPABASE_SERVICE_ROLE_KEY 로 바꿔써도 됨.
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -76,6 +74,114 @@ const genTraceId = () => `trc_${crypto.randomBytes(4).toString("hex")}`;
 const nowISO = () => new Date().toISOString();
 
 // ─────────────────────────────────────────
+// ✅ ItplayLab2 (it2) 명령 파싱 유틸 (Telegram text → job payload)
+// ─────────────────────────────────────────
+function parseKeyValues(parts) {
+  const args = {};
+  for (const p of parts) {
+    const [k, v] = p.split("=");
+    if (!k) continue;
+    args[k] = v === undefined ? true : v;
+  }
+  return args;
+}
+
+/**
+ * 예시:
+ *  /it2 health
+ *  /it2 snapshot run date=2025-12-12 portfolio=demo force=true
+ *  /it2 backfill days=30 portfolio=demo
+ *  /it2 score v1 date=2025-12-12 portfolio=demo dry_run=true
+ */
+function buildIt2CommandPayload(text, { trace_id, chat_id }) {
+  const tokens = text.trim().split(/\s+/);
+  const group = tokens[1] || "";   // health | snapshot | backfill | score
+  const action = tokens[2] || "";  // run | check | v1 ...
+  const kv = parseKeyValues(tokens.slice(3));
+
+  let cmd = null;
+
+  if (group === "health") cmd = "health.check";
+  else if (group === "snapshot" && action === "run") cmd = "snapshot.run";
+  else if (group === "backfill") cmd = "snapshot.backfill";
+  else if (group === "score") cmd = "score.v1";
+
+  if (!cmd) {
+    return {
+      ok: false,
+      error: "UNKNOWN_IT2_COMMAND",
+      hint:
+        "사용 예)\n" +
+        "/it2 health\n" +
+        "/it2 snapshot run date=YYYY-MM-DD portfolio=demo\n" +
+        "/it2 backfill days=30 portfolio=demo\n" +
+        "/it2 score v1 date=YYYY-MM-DD portfolio=demo dry_run=true",
+    };
+  }
+
+  // args 정규화
+  const args = {};
+
+  if (kv.date) args.snapshot_date = String(kv.date);
+  if (kv.portfolio) args.portfolio_id = String(kv.portfolio);
+
+  if (kv.engine_version) args.engine_version = String(kv.engine_version);
+  else args.engine_version = "v1";
+
+  if (kv.days !== undefined) args.days = Number(kv.days);
+  if (kv.concurrency !== undefined) args.concurrency = Number(kv.concurrency);
+
+  if (kv.force !== undefined) args.force = String(kv.force) === "true" || kv.force === true;
+  else args.force = false;
+
+  if (kv.dry_run !== undefined) args.dry_run = String(kv.dry_run) === "true" || kv.dry_run === true;
+  else args.dry_run = false;
+
+  // 기본값(많이 쓰는 값) 보정
+  // snapshot.run / score.v1은 날짜 없으면 "오늘"로 워커에서 보정하게 둬도 되고,
+  // 여기서 넣고 싶으면 넣어도 됨. (지금은 워커에서 보정 추천)
+  return {
+    ok: true,
+    jobType: "it2_cmd",
+    payload: {
+      namespace: "it2",
+      cmd,
+      requested_by: "telegram",
+      trace_id,
+      chat_id,
+      args,
+    },
+  };
+}
+
+// ─────────────────────────────────────────
+// ✅ Supabase job_queue에 직접 enqueue 하는 함수
+// ─────────────────────────────────────────
+async function enqueueJobToQueue({ type, payload, chat_id, trace_id }) {
+  const now = nowISO();
+
+  const { data, error } = await supabase
+    .from("job_queue")
+    .insert({
+      status: "PENDING",
+      type,
+      params: payload,
+      chat_id,
+      trace_id,
+      created_at: now,
+      updated_at: now,
+    })
+    .select()
+    .single();
+
+  if (error) {
+    console.error("[ENQUEUE] DB_ERROR", error);
+    return { ok: false, error: "DB_ERROR", detail: error };
+  }
+  return { ok: true, job: data };
+}
+
+// ─────────────────────────────────────────
 // 1) Telegram Webhook 처리
 // ─────────────────────────────────────────
 const handleTelegramWebhook = async (req, res) => {
@@ -91,17 +197,52 @@ const handleTelegramWebhook = async (req, res) => {
 
     const traceId = genTraceId();
 
+    // 접수 알림(기존 유지)
     if (shouldNotify("success"))
       await tgSend(chatId, `✅ 요청 접수\ntrace_id: ${traceId}`);
 
+    // ─────────────────────────────────────────
+    // ✅ (핵심 수정) it2 명령이면: 잇플랩2 전용 라우팅
+    // ─────────────────────────────────────────
+    if (text.trim().startsWith("/it2")) {
+      const parsed = buildIt2CommandPayload(text, {
+        trace_id: traceId,
+        chat_id: chatId,
+      });
+
+      if (!parsed.ok) {
+        await tgSend(chatId, `❌ it2 명령 오류: ${parsed.error}\n\n${parsed.hint}`);
+        return res.json({ ok: false, error: parsed.error });
+      }
+
+      const enq = await enqueueJobToQueue({
+        type: parsed.jobType,      // "it2_cmd"
+        payload: parsed.payload,   // {namespace, cmd, args...}
+        chat_id: chatId,
+        trace_id: traceId,
+      });
+
+      if (!enq.ok) {
+        await tgSend(chatId, `❌ it2 요청 enqueue 실패\ntrace_id: ${traceId}`);
+        return res.json({ ok: false, error: "ENQUEUE_FAILED" });
+      }
+
+      await tgSend(
+        chatId,
+        `🧠 it2 작업 접수 완료\ncmd: ${parsed.payload.cmd}\ntrace_id: ${traceId}`
+      );
+
+      return res.json({ ok: true });
+    }
+
+    // ─────────────────────────────────────────
+    // ✅ it2가 아니면: 기존 잇플랩1 콘텐츠 파서 그대로
+    // ─────────────────────────────────────────
     const newJob = await createJobFromPlanQueueRow(text, traceId, chatId);
 
     // ✅ newJob 자체가 null/undefined 인 상황 방어
     if (!newJob || !newJob.ok) {
-      console.error(
-        "[tg-webhook] createJobFromPlanQueueRow 반환값 이상:",
-        newJob
-      );
+      console.error("[tg-webhook] createJobFromPlanQueueRow 반환값 이상:", newJob);
       await tgSend(chatId, "❌ 요청 처리 실패");
       return res.json({ ok: false });
     }
@@ -239,10 +380,7 @@ app.post("/video/result", async (req, res) => {
       thumbnail,
     });
 
-    await tgSend(
-      job.chat_id,
-      `🎉 생성 완료!\ntrace_id: ${traceId}\n${url}`
-    );
+    await tgSend(job.chat_id, `🎉 생성 완료!\ntrace_id: ${traceId}\n${url}`);
 
     res.json({ ok: true });
   } catch (e) {
