@@ -74,6 +74,37 @@ const genTraceId = () => `trc_${crypto.randomBytes(4).toString("hex")}`;
 const nowISO = () => new Date().toISOString();
 
 // ─────────────────────────────────────────
+// ✅ 403 진단 라벨 유틸 (expected/got prefix)
+//  - 운영 중엔 prefix 길이를 줄이거나, 텔레그램 알림을 끄는 것도 고려
+// ─────────────────────────────────────────
+const mask4 = (v = "") => (v ? String(v).slice(0, 4) : "");
+const buildAuthDiag = ({ kind, expected, got }) => ({
+  kind, // "WORKER" | "ENQUEUER"
+  expected_prefix: mask4(expected),
+  got_prefix: mask4(got),
+  hint:
+    kind === "WORKER"
+      ? "Use JOBQUEUE_WORKER_SECRET"
+      : "Use JOBQUEUE_ENQUEUE_SECRET",
+});
+
+const notifyAdminAuthFail = async ({ kind, expected, got, path }) => {
+  // 옵션: Render env에 ADMIN_CHAT_ID 넣어두면 관리자에게 403 라벨 알림
+  const adminChatId = process.env.ADMIN_CHAT_ID || CONFIG.ADMIN_CHAT_ID || null;
+  if (!adminChatId) return;
+
+  const diag = buildAuthDiag({ kind, expected, got });
+  try {
+    await tgSend(
+      adminChatId,
+      `🚨 403 AUTH FAIL\npath: ${path}\nkind: ${diag.kind}\nexpected_prefix: ${diag.expected_prefix}\ngot_prefix: ${diag.got_prefix}\nhint: ${diag.hint}`
+    );
+  } catch (e) {
+    console.error("[AUTH-DIAG] admin notify failed:", e?.message || e);
+  }
+};
+
+// ─────────────────────────────────────────
 // ✅ ItplayLab2 (it2) 명령 파싱 유틸 (Telegram text → job payload)
 // ─────────────────────────────────────────
 function parseKeyValues(parts) {
@@ -95,8 +126,8 @@ function parseKeyValues(parts) {
  */
 function buildIt2CommandPayload(text, { trace_id, chat_id }) {
   const tokens = text.trim().split(/\s+/);
-  const group = tokens[1] || "";   // health | snapshot | backfill | score
-  const action = tokens[2] || "";  // run | check | v1 ...
+  const group = tokens[1] || ""; // health | snapshot | backfill | score
+  const action = tokens[2] || ""; // run | check | v1 ...
   const kv = parseKeyValues(tokens.slice(3));
 
   let cmd = null;
@@ -131,15 +162,14 @@ function buildIt2CommandPayload(text, { trace_id, chat_id }) {
   if (kv.days !== undefined) args.days = Number(kv.days);
   if (kv.concurrency !== undefined) args.concurrency = Number(kv.concurrency);
 
-  if (kv.force !== undefined) args.force = String(kv.force) === "true" || kv.force === true;
+  if (kv.force !== undefined)
+    args.force = String(kv.force) === "true" || kv.force === true;
   else args.force = false;
 
-  if (kv.dry_run !== undefined) args.dry_run = String(kv.dry_run) === "true" || kv.dry_run === true;
+  if (kv.dry_run !== undefined)
+    args.dry_run = String(kv.dry_run) === "true" || kv.dry_run === true;
   else args.dry_run = false;
 
-  // 기본값(많이 쓰는 값) 보정
-  // snapshot.run / score.v1은 날짜 없으면 "오늘"로 워커에서 보정하게 둬도 되고,
-  // 여기서 넣고 싶으면 넣어도 됨. (지금은 워커에서 보정 추천)
   return {
     ok: true,
     jobType: "it2_cmd",
@@ -202,7 +232,7 @@ const handleTelegramWebhook = async (req, res) => {
       await tgSend(chatId, `✅ 요청 접수\ntrace_id: ${traceId}`);
 
     // ─────────────────────────────────────────
-    // ✅ (핵심 수정) it2 명령이면: 잇플랩2 전용 라우팅
+    // ✅ it2 명령이면: 잇플랩2 전용 라우팅
     // ─────────────────────────────────────────
     if (text.trim().startsWith("/it2")) {
       const parsed = buildIt2CommandPayload(text, {
@@ -216,8 +246,8 @@ const handleTelegramWebhook = async (req, res) => {
       }
 
       const enq = await enqueueJobToQueue({
-        type: parsed.jobType,      // "it2_cmd"
-        payload: parsed.payload,   // {namespace, cmd, args...}
+        type: parsed.jobType, // "it2_cmd"
+        payload: parsed.payload, // {namespace, cmd, args...}
         chat_id: chatId,
         trace_id: traceId,
       });
@@ -266,18 +296,31 @@ app.post("/enqueue-job", async (req, res) => {
   const expected = CONFIG.JOBQUEUE_ENQUEUE_SECRET || "";
 
   if (!expected || secret !== expected) {
-    console.error("[ENQUEUE-JOB] ❌ UNAUTHORIZED_ENQUEUER", {
-      expected: expected && expected.slice(0, 4),
-      got: secret && secret.slice(0, 4),
+    const diag = buildAuthDiag({
+      kind: "ENQUEUER",
+      expected,
+      got: secret,
     });
-    return res
-      .status(403)
-      .json({ ok: false, error: "UNAUTHORIZED_ENQUEUER" });
+
+    console.error("[ENQUEUE-JOB] ❌ UNAUTHORIZED_ENQUEUER", diag);
+
+    // (옵션) 관리자 텔레그램 알림
+    await notifyAdminAuthFail({
+      kind: "ENQUEUER",
+      expected,
+      got: secret,
+      path: req.originalUrl || req.url,
+    });
+
+    return res.status(403).json({
+      ok: false,
+      error: "UNAUTHORIZED_ENQUEUER",
+      ...diag,
+    });
   }
 
   try {
-    const { type = "test", payload = {}, chat_id = null, trace_id } =
-      req.body || {};
+    const { type = "test", payload = {}, chat_id = null, trace_id } = req.body || {};
 
     const now = nowISO();
     const finalTraceId = trace_id || genTraceId();
@@ -319,13 +362,27 @@ app.post("/next-job", async (req, res) => {
   const expected = CONFIG.JOBQUEUE_WORKER_SECRET || "";
 
   if (!expected || secret !== expected) {
-    console.error("[NEXT-JOB] ❌ UNAUTHORIZED_WORKER", {
-      expected: expected && expected.slice(0, 4),
-      got: secret && secret.slice(0, 4),
+    const diag = buildAuthDiag({
+      kind: "WORKER",
+      expected,
+      got: secret,
     });
-    return res
-      .status(403)
-      .json({ ok: false, error: "UNAUTHORIZED_WORKER" });
+
+    console.error("[NEXT-JOB] ❌ UNAUTHORIZED_WORKER", diag);
+
+    // (옵션) 관리자 텔레그램 알림
+    await notifyAdminAuthFail({
+      kind: "WORKER",
+      expected,
+      got: secret,
+      path: req.originalUrl || req.url,
+    });
+
+    return res.status(403).json({
+      ok: false,
+      error: "UNAUTHORIZED_WORKER",
+      ...diag,
+    });
   }
 
   try {
