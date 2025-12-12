@@ -50,6 +50,10 @@ const supabase = createClient(
 // 서버 준비
 // ─────────────────────────────────────────
 const app = express();
+app.use((req, res, next) => {
+  console.log("[REQ]", req.method, req.url);
+  next();
+});
 app.use(express.json({ limit: "1mb", type: ["application/json"] }));
 
 // /next-job 로그 최소화 옵션
