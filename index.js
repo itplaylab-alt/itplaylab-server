@@ -10,6 +10,9 @@ import crypto from "crypto";
 import { createClient } from "@supabase/supabase-js";
 import { runWorkerOnce } from "./src/worker.js";
 
+// ✅ 라벨 주입 (it2)
+import { labelsForIt2Command } from "./lib/opLabels.js";
+
 // ─────────────────────────────────────────
 //  공통 설정
 // ─────────────────────────────────────────
@@ -105,6 +108,7 @@ async function tg2Send(chatId, text, extra = {}) {
 const mask4 = (v = "") => (v ? String(v).slice(0, 4) : "");
 const buildAuthDiag = ({ kind, expected, got }) => ({
   kind, // "WORKER" | "ENQUEUER"
+  // ⚠️ 운영상 prefix 노출이 민감하면 길이를 2로 줄이거나 알림을 끄면 됨
   expected_prefix: mask4(expected),
   got_prefix: mask4(got),
   hint:
@@ -194,6 +198,10 @@ function buildIt2CommandPayload(text, { trace_id, chat_id }) {
   if (kv.dry_run !== undefined)
     args.dry_run = String(kv.dry_run) === "true" || kv.dry_run === true;
   else args.dry_run = false;
+
+  // (선택) 승인 플래그도 받을 수 있게 열어둠 (락/중복방지 이후 승인게이트에서 사용)
+  if (kv.approved !== undefined)
+    args.approved = String(kv.approved) === "true" || kv.approved === true;
 
   return {
     ok: true,
@@ -298,9 +306,20 @@ const handleTelegramWebhookIt2 = async (req, res) => {
       return res.json({ ok: false, error: parsed.error });
     }
 
+    // ─────────────────────────────────────────
+    // ✅ 라벨 자동 주입 (문서 규격 → 실행 규격)
+    //   - job_queue.params.meta.labels 로 저장됨
+    // ─────────────────────────────────────────
+    const labels = labelsForIt2Command(parsed.payload.cmd, parsed.payload.args);
+
+    parsed.payload.meta = {
+      ...(parsed.payload.meta || {}),
+      labels,
+    };
+
     const enq = await enqueueJobToQueue({
       type: parsed.jobType,      // "it2_cmd"
-      payload: parsed.payload,   // {namespace, cmd, args...}
+      payload: parsed.payload,   // {namespace, cmd, args, meta.labels...}
       chat_id: chatId,
       trace_id: traceId,
     });
