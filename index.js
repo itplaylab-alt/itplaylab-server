@@ -75,6 +75,152 @@ app.use((req, res, next) => {
 });
 
 // ─────────────────────────────────────────
+// ✅ Step3: it2 auto-decide 엔드포인트 (Worker 후콜 수신)
+//   - Worker가 POST로 결과를 보내면 it2가 판단 후 it1_job을 추가로 enqueue
+//   - 중복 방지: job_queue.auto_decided_at IS NULL 조건으로 1회만 처리
+// ─────────────────────────────────────────
+app.post("/it2/auto-decide", async (req, res) => {
+  const secret = req.query.secret || req.headers["x-it2-secret"] || "";
+  const expected = CONFIG.JOBQUEUE_ENQUEUE_SECRET || "";
+
+  if (!expected || secret !== expected) {
+    return res.status(403).json({
+      ok: false,
+      error: "UNAUTHORIZED_AUTO_DECIDE",
+    });
+  }
+
+  const {
+    trace_id,
+    job_id,
+    job_type,
+    ok,
+    latency_ms,
+    result,
+    error,
+  } = req.body || {};
+
+  if (!trace_id || !job_id || !job_type) {
+    return res.status(400).json({
+      ok: false,
+      error: "BAD_REQUEST",
+      detail: "trace_id, job_id, job_type required",
+    });
+  }
+
+  const now = new Date().toISOString();
+
+  try {
+    // 1) idempotency lock: 같은 job_id에 대해 auto-decide 1회만
+    const { data: locked, error: lockErr } = await supabase
+      .from("job_queue")
+      .update({ auto_decided_at: now })
+      .eq("id", job_id)
+      .is("auto_decided_at", null)
+      .select("id, auto_decide_count")
+      .maybeSingle();
+
+    if (lockErr) {
+      console.error("[it2.auto-decide] lockErr:", lockErr);
+      return res
+        .status(500)
+        .json({ ok: false, error: "LOCK_FAILED", detail: lockErr.message });
+    }
+
+    if (!locked) {
+      // 이미 처리됨 (중복 방지)
+      console.log(
+        "[LOG]",
+        JSON.stringify({
+          event: "it2.auto_decide_dedup",
+          ok: true,
+          trace_id,
+          job_id,
+        })
+      );
+      return res.json({ ok: true, decision: "DEDUP", enqueued: 0 });
+    }
+
+    // 2) auto_decide_count 증가
+    const currentCount = Number(locked.auto_decide_count ?? 0);
+    const nextCount = currentCount + 1;
+
+    const { error: cntErr } = await supabase
+      .from("job_queue")
+      .update({ auto_decide_count: nextCount })
+      .eq("id", job_id);
+
+    if (cntErr) {
+      console.error("[it2.auto-decide] cntErr:", cntErr);
+      // count 업데이트 실패해도, lock은 걸렸으니 일단 진행은 가능
+    }
+
+    // 3) decision rule (MVP)
+    // - ok=false이면 retry job 생성 (최대 N회)
+    // - ok=true이면 NOOP (추후 KPI 기반 FORK 추가)
+    const retryMax = Number(process.env.AUTO_DECIDE_RETRY_MAX ?? 2);
+
+    let decision = "NOOP";
+    let enqueued = 0;
+
+    if (ok === false && nextCount <= retryMax) {
+      decision = "RETRY";
+
+      // ✅ 여기 cmd/args는 너희 it1 규격에 맞게 언제든 교체 가능
+      const params = {
+        namespace: "it1",
+        meta: { source: "auto-decide", parent_job_id: job_id },
+        cmd: "content.create",
+        args: { retry_of: trace_id, attempt: nextCount },
+      };
+
+      const { error: insErr } = await supabase.from("job_queue").insert({
+        type: "it1_job",
+        status: "PENDING",
+        trace_id, // trace 유지 (원하면 새 trace 발급도 가능)
+        params,
+        locked_at: null,
+        locked_by: null,
+        created_at: now,
+        updated_at: now,
+      });
+
+      if (insErr) {
+        console.error("[it2.auto-decide] enqueue retry fail:", insErr);
+        return res
+          .status(500)
+          .json({ ok: false, error: "ENQUEUE_FAIL", detail: insErr.message });
+      }
+
+      enqueued = 1;
+    }
+
+    console.log(
+      "[LOG]",
+      JSON.stringify({
+        event: "it2.auto_decide_done",
+        ok: true,
+        trace_id,
+        job_id,
+        job_type,
+        decision,
+        enqueued,
+        latency_ms,
+      })
+    );
+
+    return res.json({ ok: true, decision, enqueued });
+  } catch (e) {
+    console.error("[it2.auto-decide] exception:", e);
+    return res.status(500).json({
+      ok: false,
+      error: "AUTO_DECIDE_EXCEPTION",
+      detail: e?.message || String(e),
+    });
+  }
+});
+
+// ─────────────────────────────────────────
 // 유틸 함수
 // ─────────────────────────────────────────
 const genTraceId = () => `trc_${crypto.randomBytes(4).toString("hex")}`;
@@ -87,7 +233,8 @@ const nowISO = () => new Date().toISOString();
 const IT2_BOT_TOKEN =
   process.env.TELEGRAM_IT2_BOT_TOKEN || CONFIG.TELEGRAM_IT2_BOT_TOKEN || "";
 
-const tg2Api = (method) => `https://api.telegram.org/bot${IT2_BOT_TOKEN}/${method}`;
+const tg2Api = (method) =>
+  `https://api.telegram.org/bot${IT2_BOT_TOKEN}/${method}`;
 
 async function tg2Send(chatId, text, extra = {}) {
   if (!IT2_BOT_TOKEN) throw new Error("NO_TELEGRAM_IT2_BOT_TOKEN");
@@ -112,7 +259,6 @@ async function tg2Send(chatId, text, extra = {}) {
 const mask4 = (v = "") => (v ? String(v).slice(0, 4) : "");
 const buildAuthDiag = ({ kind, expected, got }) => ({
   kind, // "WORKER" | "ENQUEUER"
-  // ⚠️ 운영상 prefix 노출이 민감하면 길이를 2로 줄이거나 알림을 끄면 됨
   expected_prefix: mask4(expected),
   got_prefix: mask4(got),
   hint:
@@ -122,7 +268,6 @@ const buildAuthDiag = ({ kind, expected, got }) => ({
 });
 
 const notifyAdminAuthFail = async ({ kind, expected, got, path }) => {
-  // 옵션: Render env에 ADMIN_CHAT_ID 넣어두면 관리자에게 403 라벨 알림
   const adminChatId = process.env.ADMIN_CHAT_ID || CONFIG.ADMIN_CHAT_ID || null;
   if (!adminChatId) return;
 
@@ -183,7 +328,6 @@ function buildIt2CommandPayload(text, { trace_id, chat_id }) {
     };
   }
 
-  // args 정규화
   const args = {};
 
   if (kv.date) args.snapshot_date = String(kv.date);
@@ -203,7 +347,6 @@ function buildIt2CommandPayload(text, { trace_id, chat_id }) {
     args.dry_run = String(kv.dry_run) === "true" || kv.dry_run === true;
   else args.dry_run = false;
 
-  // (선택) 승인 플래그도 받을 수 있게 열어둠 (락/중복방지 이후 승인게이트에서 사용)
   if (kv.approved !== undefined)
     args.approved = String(kv.approved) === "true" || kv.approved === true;
 
@@ -266,7 +409,6 @@ const handleTelegramWebhookIt1 = async (req, res) => {
       await tgSend(chatId, `✅ 요청 접수\ntrace_id: ${traceId}`);
     }
 
-    // it1: 기존 콘텐츠 파서만
     const newJob = await createJobFromPlanQueueRow(text, traceId, chatId);
 
     if (!newJob || !newJob.ok) {
@@ -289,16 +431,19 @@ const handleTelegramWebhookIt2 = async (req, res) => {
     const chatId = body?.message?.chat?.id ?? null;
     const text = body?.message?.text ?? "";
 
-console.log("[IT2_WEBHOOK]", { hasMessage: !!body?.message, chatId, text, keys: Object.keys(body || {}) });
-    
+    console.log("[IT2_WEBHOOK]", {
+      hasMessage: !!body?.message,
+      chatId,
+      text,
+      keys: Object.keys(body || {}),
+    });
+
     if (!chatId || !text) return res.json({ ok: true });
 
     const traceId = genTraceId();
 
-    // it2 접수 알림은 it2 봇으로
     await tg2Send(chatId, `✅ it2 요청 접수\ntrace_id: ${traceId}`);
 
-    // it2 봇에서는 "/it2" 없이 보내도 되게끔 자동 prefix
     const normalized = text.trim();
     const it2Text = normalized.startsWith("/it2") ? normalized : `/it2 ${normalized}`;
 
@@ -312,10 +457,6 @@ console.log("[IT2_WEBHOOK]", { hasMessage: !!body?.message, chatId, text, keys: 
       return res.json({ ok: false, error: parsed.error });
     }
 
-    // ─────────────────────────────────────────
-    // ✅ 라벨 자동 주입 (문서 규격 → 실행 규격)
-    //   - job_queue.params.meta.labels 로 저장됨
-    // ─────────────────────────────────────────
     const labels = labelsForIt2Command(parsed.payload.cmd, parsed.payload.args);
 
     parsed.payload.meta = {
@@ -324,8 +465,8 @@ console.log("[IT2_WEBHOOK]", { hasMessage: !!body?.message, chatId, text, keys: 
     };
 
     const enq = await enqueueJobToQueue({
-      type: parsed.jobType,      // "it2_cmd"
-      payload: parsed.payload,   // {namespace, cmd, args, meta.labels...}
+      type: parsed.jobType,
+      payload: parsed.payload,
       chat_id: chatId,
       trace_id: traceId,
     });
@@ -378,7 +519,6 @@ app.post("/enqueue-job", async (req, res) => {
 
     console.error("[ENQUEUE-JOB] ❌ UNAUTHORIZED_ENQUEUER", diag);
 
-    // (옵션) 관리자 텔레그램 알림
     await notifyAdminAuthFail({
       kind: "ENQUEUER",
       expected,
@@ -432,7 +572,6 @@ app.post("/enqueue-job", async (req, res) => {
 // 3) Worker 전용 엔드포인트 (/next-job)
 // ─────────────────────────────────────────
 app.post("/next-job", async (req, res) => {
-  // 1. 시크릿 검사
   const secret = req.query.secret || "";
   const expected = CONFIG.JOBQUEUE_WORKER_SECRET || "";
 
@@ -445,7 +584,6 @@ app.post("/next-job", async (req, res) => {
 
     console.error("[NEXT-JOB] ❌ UNAUTHORIZED_WORKER", diag);
 
-    // (옵션) 관리자 텔레그램 알림
     await notifyAdminAuthFail({
       kind: "WORKER",
       expected,
@@ -461,15 +599,12 @@ app.post("/next-job", async (req, res) => {
   }
 
   try {
-    // 2. Worker 한 번 실행 → 다음 Job 가져오기
     const result = await runWorkerOnce();
 
-    // Job 이 없을 때: ok:true, has_job:false
     if (!result || !result.has_job || !result.job) {
       return res.json({ ok: true, has_job: false });
     }
 
-    // 3. Job 이 있을 때: ok:true, has_job:true, job:{...}
     return res.json({
       ok: true,
       has_job: true,
