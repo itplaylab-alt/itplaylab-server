@@ -261,14 +261,12 @@ export async function popNextJobForWorker(
     // ────────────────────────────────────
     // 0) 디버그용: PENDING + unlocked 개수 로깅
     // ────────────────────────────────────
-    const {
-      count: pendingCount,
-      error: countError,
-    } = await supabase
-      .from("job_queue")
-      .select("*", { count: "exact", head: true })
-      .eq("status", "PENDING")
-      .is("locked_at", null);
+const { count: pendingCount, error: countError } = await supabase
+  .from("job_queue")
+  .select("*", { count: "exact", head: true })
+  .eq("status", "PENDING")
+  .is("locked_at", null)
+  .in("type", ["it2_cmd", "it1_job"]);
 
     if (countError) {
       logError({
@@ -288,17 +286,15 @@ export async function popNextJobForWorker(
     // ────────────────────────────────────
     // 1) 가장 오래된 PENDING + unlocked Job 1건 조회
     // ────────────────────────────────────
-    const {
-      data: candidate,
-      error: selectError,
-    } = await supabase
-      .from("job_queue")
-      .select("*")
-      .eq("status", "PENDING")
-      .is("locked_at", null)
-      .order("created_at", { ascending: true, nullsFirst: true })
-      .limit(1)
-      .maybeSingle(); // supabase-js v2 기준
+const { data: candidate, error: selectError } = await supabase
+  .from("job_queue")
+  .select("*")
+  .eq("status", "PENDING")
+  .is("locked_at", null)
+  .in("type", ["it2_cmd", "it1_job"])   // ✅ it1_job 포함
+  .order("created_at", { ascending: true, nullsFirst: true })
+  .limit(1)
+  .maybeSingle(); // supabase-js v2 기준
 
     if (selectError) {
       logError({
