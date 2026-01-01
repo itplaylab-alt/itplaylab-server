@@ -28,7 +28,12 @@ function pickJobNamespace(job) {
 }
 
 function pickJobChatId(job) {
-  return job?.params?.meta?.chat_id ?? job?.params?.meta?.chatId ?? job?.chat_id ?? null;
+  return (
+    job?.params?.meta?.chat_id ??
+    job?.params?.meta?.chatId ??
+    job?.chat_id ??
+    null
+  );
 }
 
 async function notifyJob(job, text) {
@@ -49,18 +54,15 @@ function kstDateISO(d = new Date()) {
   return kst.toISOString().slice(0, 10);
 }
 
-// ─────────────────────────────────────────
 // ✅ auto-decide 호출(후콜) 유틸
-// ─────────────────────────────────────────
-async function callAutoDecide(trace_id) {
+async function callAutoDecide(payload) {
   const url = process.env.IT2_AUTO_DECIDE_URL;
   if (!url) {
     console.warn("[auto-decide] IT2_AUTO_DECIDE_URL not set");
     return;
   }
 
-  // Node 18+이면 fetch 내장.
-  // 혹시 Node 16이면 아래 dynamic import로 보완.
+  // Node 18+ fetch 내장 / 하위버전 보완
   let _fetch = globalThis.fetch;
   if (!_fetch) {
     const mod = await import("node-fetch");
@@ -72,29 +74,38 @@ async function callAutoDecide(trace_id) {
   const t = setTimeout(() => controller.abort(), 10_000);
 
   try {
-    await _fetch(url, {
+    const res = await _fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ trace_id }),
+      body: JSON.stringify(payload),
       signal: controller.signal,
     });
 
+    const json = await res.json().catch(() => null);
+
+    if (!res.ok) {
+      console.warn("[auto-decide] non-200", res.status, json);
+      return;
+    }
+
+    // 필요하면 로그
+    // console.log("[auto-decide] ok", json);
     console.log(
       "[LOG]",
       JSON.stringify({
         event: "worker.auto_decide_called",
         ok: true,
-        trace_id,
+        trace_id: payload?.trace_id,
       })
     );
   } catch (e) {
-    console.warn("[auto-decide] call failed:", e?.message || e);
+    console.warn("[auto-decide] failed", e?.message || String(e));
     console.log(
       "[LOG]",
       JSON.stringify({
         event: "worker.auto_decide_failed",
         ok: false,
-        trace_id,
+        trace_id: payload?.trace_id,
         error: e?.message || String(e),
       })
     );
@@ -380,9 +391,17 @@ export async function runWorkerOnce() {
       if (result.ok) {
         await markJobDone(job.id);
 
-        // ✅ 핵심: it1_job이 성공했을 때만 auto-decide 후콜
+        // ✅ 핵심: it1_job 성공 시 auto-decide 후콜(payload로)
         if (job.type === "it1_job") {
-          await callAutoDecide(job.trace_id);
+          await callAutoDecide({
+            trace_id: job.trace_id,
+            job_id: job.id,
+            job_type: job.type,
+            ok: true,
+            latency_ms,
+            result,
+            error: null,
+          });
         }
 
         await notifyJob(
@@ -394,6 +413,19 @@ export async function runWorkerOnce() {
       } else {
         await markJobFailed(job.id, result.error || "PROCESS_FAIL");
 
+        // ✅ (권장) it1_job 실패도 auto-decide로 전달하면 retry/fork 판단 가능
+        if (job.type === "it1_job") {
+          await callAutoDecide({
+            trace_id: job.trace_id,
+            job_id: job.id,
+            job_type: job.type,
+            ok: false,
+            latency_ms,
+            result: null,
+            error: { message: result.error || "PROCESS_FAIL", detail: result.detail ?? null },
+          });
+        }
+
         await notifyJob(
           job,
           `❌ 작업 실패\ntype: ${job.type}\ntrace_id: ${job.trace_id}\nerror: ${
@@ -402,6 +434,8 @@ export async function runWorkerOnce() {
         );
       }
     } catch (procErr) {
+      const latency_ms = Date.now() - startedAt;
+
       console.error(
         "[LOG]",
         JSON.stringify({
@@ -415,6 +449,19 @@ export async function runWorkerOnce() {
       );
 
       await markJobFailed(job.id, procErr?.message || String(procErr));
+
+      // ✅ (권장) it1_job 예외도 auto-decide로 전달
+      if (job.type === "it1_job") {
+        await callAutoDecide({
+          trace_id: job.trace_id,
+          job_id: job.id,
+          job_type: job.type,
+          ok: false,
+          latency_ms,
+          result: null,
+          error: { message: procErr?.message || String(procErr) },
+        });
+      }
 
       await notifyJob(
         job,
