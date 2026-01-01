@@ -5,12 +5,7 @@
 import crypto from "crypto";
 import { createClient } from "@supabase/supabase-js";
 
-import {
-  popNextJobForWorker,
-  markJobDone,
-  markJobFailed,
-} from "./jobRepo.js";
-
+import { popNextJobForWorker, markJobDone, markJobFailed } from "./jobRepo.js";
 import { tgSend, tg2Send } from "../services/telegramBot.js";
 
 const DEFAULT_WORKER_ID = process.env.WORKER_ID || "itplaylab-worker-1";
@@ -33,12 +28,7 @@ function pickJobNamespace(job) {
 }
 
 function pickJobChatId(job) {
-  return (
-    job?.params?.meta?.chat_id ??
-    job?.params?.meta?.chatId ??
-    job?.chat_id ??
-    null
-  );
+  return job?.params?.meta?.chat_id ?? job?.params?.meta?.chatId ?? job?.chat_id ?? null;
 }
 
 async function notifyJob(job, text) {
@@ -49,7 +39,6 @@ async function notifyJob(job, text) {
   return ns === "it2" ? tg2Send(chatId, text) : tgSend(chatId, text);
 }
 
-
 const nowISO = () => new Date().toISOString();
 const genRunId = () => `it2_${Date.now()}_${crypto.randomBytes(3).toString("hex")}`;
 
@@ -58,6 +47,60 @@ function kstDateISO(d = new Date()) {
   const utc = d.getTime() + d.getTimezoneOffset() * 60000;
   const kst = new Date(utc + 9 * 60 * 60000);
   return kst.toISOString().slice(0, 10);
+}
+
+// ─────────────────────────────────────────
+// ✅ auto-decide 호출(후콜) 유틸
+// ─────────────────────────────────────────
+async function callAutoDecide(trace_id) {
+  const url = process.env.IT2_AUTO_DECIDE_URL;
+  if (!url) {
+    console.warn("[auto-decide] IT2_AUTO_DECIDE_URL not set");
+    return;
+  }
+
+  // Node 18+이면 fetch 내장.
+  // 혹시 Node 16이면 아래 dynamic import로 보완.
+  let _fetch = globalThis.fetch;
+  if (!_fetch) {
+    const mod = await import("node-fetch");
+    _fetch = mod.default;
+  }
+
+  // 10초 타임아웃
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 10_000);
+
+  try {
+    await _fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ trace_id }),
+      signal: controller.signal,
+    });
+
+    console.log(
+      "[LOG]",
+      JSON.stringify({
+        event: "worker.auto_decide_called",
+        ok: true,
+        trace_id,
+      })
+    );
+  } catch (e) {
+    console.warn("[auto-decide] call failed:", e?.message || e);
+    console.log(
+      "[LOG]",
+      JSON.stringify({
+        event: "worker.auto_decide_failed",
+        ok: false,
+        trace_id,
+        error: e?.message || String(e),
+      })
+    );
+  } finally {
+    clearTimeout(t);
+  }
 }
 
 // ─────────────────────────────────────────
@@ -167,25 +210,22 @@ async function it2SnapshotRun({ args, trace_id }) {
 
   // 2) 스냅샷 UPSERT
   if (!dry_run) {
-    // Supabase upsert는 unique 제약/PK 기반으로 동작
-    const up = await supabase
-      .from("risk_snapshot_daily")
-      .upsert(
-        {
-          snapshot_date: snap.snapshot_date,
-          portfolio_id: snap.portfolio_id,
-          engine_version: snap.engine_version,
-          run_id: snap.run_id,
-          risk_score: snap.risk_score,
-          risk_level: snap.risk_level,
-          features: snap.features,
-          positions_summary: snap.positions_summary,
-          notes: snap.notes,
-          ok: true,
-          updated_at: nowISO(),
-        },
-        { onConflict: "snapshot_date,portfolio_id" }
-      );
+    const up = await supabase.from("risk_snapshot_daily").upsert(
+      {
+        snapshot_date: snap.snapshot_date,
+        portfolio_id: snap.portfolio_id,
+        engine_version: snap.engine_version,
+        run_id: snap.run_id,
+        risk_score: snap.risk_score,
+        risk_level: snap.risk_level,
+        features: snap.features,
+        positions_summary: snap.positions_summary,
+        notes: snap.notes,
+        ok: true,
+        updated_at: nowISO(),
+      },
+      { onConflict: "snapshot_date,portfolio_id" }
+    );
 
     if (up.error) {
       return { ok: false, error: "SNAPSHOT_UPSERT_FAIL", detail: up.error.message };
@@ -225,26 +265,17 @@ async function it2SnapshotRun({ args, trace_id }) {
 }
 
 async function handleIt2Cmd(job) {
-  // index.js에서 params에 넣었던 payload
   const payload = job.params || {};
   const cmd = payload.cmd;
   const args = payload.args || {};
   const trace_id = job.trace_id;
 
-  if (!cmd) {
-    return { ok: false, error: "NO_CMD_IN_PARAMS" };
-  }
+  if (!cmd) return { ok: false, error: "NO_CMD_IN_PARAMS" };
 
-  if (cmd === "health.check") {
-    return await it2HealthCheck();
-  }
-
-  if (cmd === "snapshot.run") {
-    return await it2SnapshotRun({ args, trace_id });
-  }
+  if (cmd === "health.check") return await it2HealthCheck();
+  if (cmd === "snapshot.run") return await it2SnapshotRun({ args, trace_id });
 
   if (cmd === "snapshot.backfill") {
-    // MVP: backfill은 run을 날짜 루프로 돌리면 됨
     const days = Number(args.days ?? 7);
     const portfolio_id = args.portfolio_id || "default";
     const engine_version = args.engine_version || "v1";
@@ -261,6 +292,7 @@ async function handleIt2Cmd(job) {
         args: { snapshot_date, portfolio_id, engine_version, dry_run, force },
         trace_id,
       });
+
       results.push({ snapshot_date, ok: r.ok, skipped: r.skipped || false });
       if (!r.ok) return { ok: false, error: "BACKFILL_FAILED", detail: r };
     }
@@ -269,11 +301,15 @@ async function handleIt2Cmd(job) {
   }
 
   if (cmd === "score.v1") {
-    // MVP: score는 "계산만" = demo 계산 결과만 리턴
     const snapshot_date = args.snapshot_date || kstDateISO();
     const portfolio_id = args.portfolio_id || "default";
     const snap = computeDemoRiskSnapshot({ snapshot_date, portfolio_id });
-    return { ok: true, snapshot_date, portfolio_id, metrics: { risk_score: snap.risk_score, risk_level: snap.risk_level } };
+    return {
+      ok: true,
+      snapshot_date,
+      portfolio_id,
+      metrics: { risk_score: snap.risk_score, risk_level: snap.risk_level },
+    };
   }
 
   return { ok: false, error: "UNKNOWN_CMD", cmd };
@@ -309,81 +345,93 @@ export async function runWorkerOnce() {
       })
     );
 
-// 3) 실제 작업 처리
-try {
-  let result = { ok: true };
+    // 3) 실제 작업 처리
+    try {
+      let result = { ok: true };
 
-  // ✅ 여기서 type 분기
-  if (job.type === "it2_cmd") {
-    result = await handleIt2Cmd(job);
-  } else {
-    // 기존(it1) 타입은 지금은 그대로 STUB 유지
-    result = { ok: true, note: "stub_done" };
-  }
+      // ✅ type 분기
+      if (job.type === "it2_cmd") {
+        result = await handleIt2Cmd(job);
+      } else if (job.type === "it1_job") {
+        // TODO: 실제 it1 실행 로직(n8n 호출 등)로 교체 예정
+        // 지금은 STUB
+        result = { ok: true, note: "stub_done" };
+      } else {
+        // 알 수 없는 타입은 실패 처리
+        result = { ok: false, error: "UNKNOWN_JOB_TYPE", detail: job.type };
+      }
 
-  const latency_ms = Date.now() - startedAt;
+      const latency_ms = Date.now() - startedAt;
 
-  // 결과 로그(표준)
-  console.log(
-    "[LOG]",
-    JSON.stringify({
-      event: "worker.job_result",
-      ok: !!result.ok,
-      id: job.id,
-      trace_id: job.trace_id,
-      type: job.type,
-      latency_ms,
-      result,
-    })
-  );
+      // 결과 로그(표준)
+      console.log(
+        "[LOG]",
+        JSON.stringify({
+          event: "worker.job_result",
+          ok: !!result.ok,
+          id: job.id,
+          trace_id: job.trace_id,
+          type: job.type,
+          latency_ms,
+          result,
+        })
+      );
 
-  if (result.ok) {
-    await markJobDone(job.id);
+      if (result.ok) {
+        await markJobDone(job.id);
 
-    await notifyJob(
-      job,
-      `✅ 작업 완료\ntype: ${job.type}\ntrace_id: ${job.trace_id}\nlatency_ms: ${latency_ms}${result?.skipped ? "\n(skipped)" : ""}`
+        // ✅ 핵심: it1_job이 성공했을 때만 auto-decide 후콜
+        if (job.type === "it1_job") {
+          await callAutoDecide(job.trace_id);
+        }
+
+        await notifyJob(
+          job,
+          `✅ 작업 완료\ntype: ${job.type}\ntrace_id: ${job.trace_id}\nlatency_ms: ${latency_ms}${
+            result?.skipped ? "\n(skipped)" : ""
+          }`
+        );
+      } else {
+        await markJobFailed(job.id, result.error || "PROCESS_FAIL");
+
+        await notifyJob(
+          job,
+          `❌ 작업 실패\ntype: ${job.type}\ntrace_id: ${job.trace_id}\nerror: ${
+            result.error || "PROCESS_FAIL"
+          }`
+        );
+      }
+    } catch (procErr) {
+      console.error(
+        "[LOG]",
+        JSON.stringify({
+          event: "worker.process_error",
+          ok: false,
+          id: job.id,
+          trace_id: job.trace_id,
+          type: job.type,
+          error: procErr?.message || String(procErr),
+        })
+      );
+
+      await markJobFailed(job.id, procErr?.message || String(procErr));
+
+      await notifyJob(
+        job,
+        `❌ 작업 처리 중 예외\ntrace_id: ${job.trace_id}\n${procErr?.message || String(procErr)}`
+      );
+    }
+
+    return { has_job: true, job };
+  } catch (e) {
+    console.error(
+      "[LOG]",
+      JSON.stringify({
+        event: "worker.error",
+        ok: false,
+        error: e?.message || String(e),
+      })
     );
-  } else {
-    await markJobFailed(job.id, result.error || "PROCESS_FAIL");
-
-    await notifyJob(
-      job,
-      `❌ 작업 실패\ntype: ${job.type}\ntrace_id: ${job.trace_id}\nerror: ${result.error || "PROCESS_FAIL"}`
-    );
+    throw e;
   }
-} catch (procErr) {
-  console.error(
-    "[LOG]",
-    JSON.stringify({
-      event: "worker.process_error",
-      ok: false,
-      id: job.id,
-      trace_id: job.trace_id,
-      type: job.type,
-      error: procErr?.message || String(procErr),
-    })
-  );
-
-  await markJobFailed(job.id, procErr?.message || String(procErr));
-
-  await notifyJob(
-    job,
-    `❌ 작업 처리 중 예외\ntrace_id: ${job.trace_id}\n${procErr?.message || String(procErr)}`
-  );
 }
-
-  return { has_job: true, job };
-} catch (e) {
-  console.error(
-    "[LOG]",
-    JSON.stringify({
-      event: "worker.error",
-      ok: false,
-      error: e?.message || String(e),
-    })
-  );
-  throw e;
-}
-}
-
