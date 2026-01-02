@@ -1,7 +1,7 @@
-// index.js — ItplayLab (API 전용 안정화 버전)
+// index.js — ItplayLab (API 전용 안정화 + /next-job capabilities 매칭 버전)
 // Node 18+ / ESM
 // ✅ Web(API)는 job 실행을 절대 하지 않는다.
-// ✅ /next-job = claim + 반환만
+// ✅ /next-job = claim + 반환만 (capabilities/labels/priority 매칭 포함)
 // ✅ /event = event_log 기록 전담 (idempotency_key upsert)
 
 import "dotenv/config";
@@ -19,27 +19,15 @@ import { labelsForIt2Command } from "./lib/opLabels.js";
 import { CONFIG } from "./lib/config.js";
 
 // 서비스 계층 (it1 bot)
-import {
-  tgSend,
-  tgAnswerCallback,
-  buildNotifyMessage,
-  shouldNotify,
-} from "./services/telegramBot.js";
+import { tgSend, shouldNotify } from "./services/telegramBot.js";
 
 // 리포지토리 계층 (Supabase + GAS)
-import {
-  findByTraceId,
-  updateVideoStatus,
-  createJobFromPlanQueueRow,
-} from "./src/jobRepo.js";
+import { findByTraceId, updateVideoStatus, createJobFromPlanQueueRow } from "./src/jobRepo.js";
 
 // ─────────────────────────────────────────
 // Supabase 클라이언트 (job_queue/event_log용)  ✅ API에서만 사용
 // ─────────────────────────────────────────
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
 // ─────────────────────────────────────────
 // ✅ event_log 원장 기록 유틸 (API 전담)
@@ -277,17 +265,8 @@ app.post("/event", async (req, res) => {
   }
 
   const body = req.body || {};
-  const {
-    trace_id,
-    job_id,
-    job_type,
-    worker_id,
-    event_type,
-    ts,
-    idempotency_key,
-    attempt,
-    data,
-  } = body;
+  const { trace_id, job_id, job_type, worker_id, event_type, ts, idempotency_key, attempt, data } =
+    body;
 
   if (!event_type || !idempotency_key) {
     return res.status(400).json({
@@ -475,7 +454,14 @@ app.post("/it2/auto-decide", async (req, res) => {
       ok: true,
       latency_ms: Date.now() - t0,
       message: decision,
-      payload: { actor: "it2", decision, enqueued, auto_decide_count: nextCount, retry_max: retryMax, it1_ok: ok },
+      payload: {
+        actor: "it2",
+        decision,
+        enqueued,
+        auto_decide_count: nextCount,
+        retry_max: retryMax,
+        it1_ok: ok,
+      },
       idempotency_key: `${job_id}:it2_decide:${nextCount}`,
     });
 
@@ -492,7 +478,11 @@ app.post("/it2/auto-decide", async (req, res) => {
       idempotency_key: `${job_id}:it2_exception`,
     });
 
-    return res.status(500).json({ ok: false, error: "AUTO_DECIDE_EXCEPTION", detail: e?.message || String(e) });
+    return res.status(500).json({
+      ok: false,
+      error: "AUTO_DECIDE_EXCEPTION",
+      detail: e?.message || String(e),
+    });
   }
 });
 
@@ -656,11 +646,96 @@ app.post("/enqueue-job", async (req, res) => {
 });
 
 // ─────────────────────────────────────────
-// 3) Worker 전용 엔드포인트 (/next-job)  ✅ claim + 반환만
+// 3) Worker 전용 엔드포인트 (/next-job)
+// ✅ claim + 반환만 + capabilities 매칭 + priority 정렬 + 경합 재시도
+//
+// 인증:
 //   - Authorization: Bearer <JOBQUEUE_WORKER_SECRET> (권장)
 //   - 하위호환: ?secret=
-//   - 응답: { job, server_ts, backoff_ms, attempt }
+//
+// 요청(body):
+//   { worker_id, capabilities, namespace_allow, type_allow, label_allow, label_deny, prefetch }
+//
+// 응답:
+//   { job, server_ts, backoff_ms, attempt }
 // ─────────────────────────────────────────
+
+// ---- matching helpers ----
+function arr(x) {
+  return Array.isArray(x) ? x : [];
+}
+function getNamespace(job) {
+  return job?.params?.namespace ?? null;
+}
+function getLabels(job) {
+  return arr(job?.params?.meta?.labels);
+}
+function getRequiredCaps(job) {
+  return arr(job?.params?.meta?.required_capabilities);
+}
+function getPriority(job) {
+  const p = job?.params?.meta?.priority;
+  const n = Number(p);
+  return Number.isFinite(n) ? n : 0;
+}
+function hasAnyOverlap(a = [], b = []) {
+  const setB = new Set(b);
+  for (const x of a) if (setB.has(x)) return true;
+  return false;
+}
+function isSubset(required = [], have = []) {
+  const setHave = new Set(have);
+  for (const r of required) if (!setHave.has(r)) return false;
+  return true;
+}
+function matchJobToWorker(job, reqCaps) {
+  const workerCaps = arr(reqCaps.capabilities);
+  const nsAllow = arr(reqCaps.namespace_allow);
+  const typeAllow = arr(reqCaps.type_allow);
+  const labelAllow = arr(reqCaps.label_allow);
+  const labelDeny = arr(reqCaps.label_deny);
+
+  // 1) namespace_allow
+  if (nsAllow.length > 0) {
+    const ns = getNamespace(job);
+    if (!ns || !nsAllow.includes(ns)) return false;
+  }
+
+  // 2) type_allow
+  if (typeAllow.length > 0) {
+    if (!job?.type || !typeAllow.includes(job.type)) return false;
+  }
+
+  // 3) required_capabilities ⊆ worker.capabilities
+  const required = getRequiredCaps(job);
+  if (required.length > 0 && !isSubset(required, workerCaps)) return false;
+
+  // 4) label deny 우선
+  const labels = getLabels(job);
+  if (labelDeny.length > 0 && hasAnyOverlap(labels, labelDeny)) return false;
+
+  // 5) label allow(선택) - allow가 있으면 교집합 1개 이상 필요
+  if (labelAllow.length > 0 && !hasAnyOverlap(labels, labelAllow)) return false;
+
+  return true;
+}
+function sortCandidates(a, b) {
+  // priority desc, created_at asc
+  const pa = getPriority(a);
+  const pb = getPriority(b);
+  if (pb !== pa) return pb - pa;
+
+  const ca = new Date(a.created_at).getTime();
+  const cb = new Date(b.created_at).getTime();
+  return ca - cb;
+}
+
+// 운영 파라미터(환경변수로 튜닝 가능)
+const NEXT_JOB_CANDIDATE_LIMIT = Number(process.env.NEXT_JOB_CANDIDATE_LIMIT ?? 50);
+const NEXT_JOB_EMPTY_BACKOFF_MS = Number(process.env.NEXT_JOB_EMPTY_BACKOFF_MS ?? 1500);
+const NEXT_JOB_NO_MATCH_BACKOFF_MS = Number(process.env.NEXT_JOB_NO_MATCH_BACKOFF_MS ?? 300);
+const NEXT_JOB_RACE_BACKOFF_MS = Number(process.env.NEXT_JOB_RACE_BACKOFF_MS ?? 300);
+
 app.post("/next-job", async (req, res) => {
   const auth = req.headers["authorization"] || "";
   const bearer = auth.startsWith("Bearer ") ? auth.slice(7) : "";
@@ -685,68 +760,94 @@ app.post("/next-job", async (req, res) => {
   const worker_id = req.body?.worker_id || "unknown-worker";
   const now = nowISO();
 
+  // 요청 스펙(선택 필드 포함)
+  const requestCaps = {
+    capabilities: req.body?.capabilities ?? [],
+    namespace_allow: req.body?.namespace_allow ?? [],
+    type_allow: req.body?.type_allow ?? [],
+    label_allow: req.body?.label_allow ?? [],
+    label_deny: req.body?.label_deny ?? [],
+  };
+
   try {
-    // 1) PENDING 1건 후보 조회
-    const { data: pending, error: selErr } = await supabase
+    // 1) 후보 N개를 가져온다 (PENDING, unlocked)
+    const { data: rows, error: selErr } = await supabase
       .from("job_queue")
       .select("*")
       .eq("status", "PENDING")
       .is("locked_at", null)
-      .order("created_at", { ascending: true })
-      .limit(1);
+      .order("created_at", { ascending: true }) // 기본 FIFO
+      .limit(NEXT_JOB_CANDIDATE_LIMIT);
 
     if (selErr) {
       console.error("[NEXT-JOB] select error:", selErr.message);
       return res.status(500).json({ ok: false, error: "DB_SELECT_FAIL", detail: selErr.message });
     }
 
-    if (!pending || pending.length === 0) {
+    if (!rows || rows.length === 0) {
       return res.json({
         job: null,
         server_ts: now,
-        backoff_ms: 1500,
+        backoff_ms: NEXT_JOB_EMPTY_BACKOFF_MS,
         attempt: 0,
       });
     }
 
-    const job = pending[0];
+    // 2) 매칭 필터 + priority/created_at 정렬
+    const matched = rows.filter((job) => matchJobToWorker(job, requestCaps)).sort(sortCandidates);
 
-    // 2) claim(lock) — 경합 가드 포함
-    const { data: locked, error: upErr } = await supabase
-      .from("job_queue")
-      .update({
-        status: "LOCKED",
-        locked_at: now,
-        locked_by: worker_id,
-        updated_at: now,
-      })
-      .eq("id", job.id)
-      .eq("status", "PENDING")
-      .is("locked_at", null)
-      .select("*")
-      .maybeSingle();
-
-    if (upErr) {
-      console.error("[NEXT-JOB] lock update error:", upErr.message);
-      return res.status(500).json({ ok: false, error: "LOCK_FAIL", detail: upErr.message });
-    }
-
-    if (!locked) {
-      // 누가 먼저 집음 → 짧은 backoff
+    if (matched.length === 0) {
       return res.json({
         job: null,
         server_ts: now,
-        backoff_ms: 500,
+        backoff_ms: NEXT_JOB_NO_MATCH_BACKOFF_MS,
         attempt: 0,
       });
     }
 
-    // ✅ /next-job 에서는 event_log 기록하지 않음 (고정)
+    // 3) 하나씩 LOCK 시도 (경합이면 다음 후보)
+    for (const candidate of matched) {
+      const lockTs = nowISO();
+
+      const { data: locked, error: upErr } = await supabase
+        .from("job_queue")
+        .update({
+          status: "LOCKED",
+          locked_at: lockTs,
+          locked_by: worker_id,
+          updated_at: lockTs,
+        })
+        .eq("id", candidate.id)
+        .eq("status", "PENDING")
+        .is("locked_at", null)
+        .select("*")
+        .maybeSingle();
+
+      if (upErr) {
+        console.error("[NEXT-JOB] lock update error:", upErr.message);
+        return res.status(500).json({ ok: false, error: "LOCK_FAIL", detail: upErr.message });
+      }
+
+      if (!locked) {
+        // 누가 먼저 집음 → 다음 후보
+        continue;
+      }
+
+      // ✅ /next-job 에서는 event_log 기록하지 않음 (고정)
+      return res.json({
+        job: locked,
+        server_ts: lockTs,
+        backoff_ms: 0,
+        attempt: Number(locked.attempt ?? 1),
+      });
+    }
+
+    // matched는 있었는데 모두 경합으로 실패
     return res.json({
-      job: locked,
+      job: null,
       server_ts: now,
-      backoff_ms: 0,
-      attempt: Number(locked.attempt ?? 1),
+      backoff_ms: NEXT_JOB_RACE_BACKOFF_MS,
+      attempt: 0,
     });
   } catch (e) {
     console.error("[NEXT-JOB] 🧨 exception:", e?.message || String(e));
