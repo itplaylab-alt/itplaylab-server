@@ -1,9 +1,12 @@
 {
   "name": "itplaylab-server",
   "version": "1.0.0",
-  "description": "Render → GAS Bridge + Notify + OpenAI Integration",
+  "description": "Render -> GAS Bridge + Notify + OpenAI Integration",
   "main": "index.js",
   "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "node index.js"
   },
