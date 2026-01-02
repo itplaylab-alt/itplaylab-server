@@ -17,6 +17,57 @@ const supabase = createClient(
 );
 
 // ─────────────────────────────────────────
+// event_log (원장) 기록 유틸  ✅ Step6: claimed를 여기서 찍기
+// ─────────────────────────────────────────
+async function logEventSafe({
+  trace_id,
+  job_id,
+  stage,
+  ok,
+  latency_ms = null,
+  message = "",
+  payload = {},
+  idempotency_key = null,
+}) {
+  try {
+    // ⚠️ 권장: event_log에 idempotency_key 컬럼 + unique index가 있어야 중복 방지가 완벽
+    // create unique index if not exists event_log_idempotency_key_uniq
+    // on event_log (idempotency_key) where idempotency_key is not null;
+
+    const row = {
+      trace_id: trace_id ?? "no-trace",
+      job_id: job_id ?? null,
+      stage,
+      ok: !!ok,
+      latency_ms,
+      message,
+      payload,
+      idempotency_key,
+      created_at: new Date().toISOString(),
+    };
+
+    // ✅ 중복 방지: idempotency_key 기준 upsert (중복이면 무시)
+    if (idempotency_key) {
+      const { error } = await supabase
+        .from("event_log")
+        .upsert(row, { onConflict: "idempotency_key", ignoreDuplicates: true });
+
+      if (error) {
+        console.warn("[event_log] upsert failed:", error.message);
+      }
+      return;
+    }
+
+    const { error } = await supabase.from("event_log").insert(row);
+    if (error) {
+      console.warn("[event_log] insert failed:", error.message);
+    }
+  } catch (e) {
+    console.warn("[event_log] exception:", e?.message || String(e));
+  }
+}
+
+// ─────────────────────────────────────────
 // 유틸
 // ─────────────────────────────────────────
 function pickJobNamespace(job) {
@@ -88,8 +139,6 @@ async function callAutoDecide(payload) {
       return;
     }
 
-    // 필요하면 로그
-    // console.log("[auto-decide] ok", json);
     console.log(
       "[LOG]",
       JSON.stringify({
@@ -333,7 +382,7 @@ export async function runWorkerOnce() {
   const startedAt = Date.now();
 
   try {
-    // 1) 다음 PENDING job 하나 가져오기
+    // 1) 다음 PENDING job 하나 가져오기 (락은 jobRepo에서)
     const job = await popNextJobForWorker(DEFAULT_WORKER_ID);
 
     // 2) Job 없으면 종료
@@ -343,6 +392,27 @@ export async function runWorkerOnce() {
       );
       return { has_job: false, job: null };
     }
+
+    // ✅ Step 6-2: "진짜 실행 시작" 순간에만 job.claimed 기록
+    // - /next-job에서는 절대 기록하지 않음
+    // - idempotency_key로 중복 방지
+    await logEventSafe({
+      trace_id: job.trace_id || "unknown_trace",
+      job_id: job.id || null,
+      stage: "job.claimed",
+      ok: true,
+      latency_ms: Date.now() - startedAt,
+      message: "CLAIMED",
+      idempotency_key: job?.id ? `job.claimed:${job.id}` : null,
+      payload: {
+        actor: "worker",
+        worker_id: DEFAULT_WORKER_ID,
+        type: job.type ?? null,
+        status: job.status ?? null,
+        locked_at: job.locked_at ?? null,
+        locked_by: job.locked_by ?? null,
+      },
+    });
 
     console.log(
       "[LOG]",
@@ -362,11 +432,17 @@ export async function runWorkerOnce() {
 
       // ✅ type 분기
       if (job.type === "it2_cmd") {
+        // (선택) stage를 더 엄격히 쓰고 싶으면 아래 2줄 활성화 가능
+        // await logEventSafe({ trace_id: job.trace_id, job_id: job.id, stage: "it2.received", ok: true, message: "IT2_RECEIVED", payload:{ actor:"worker", worker_id: DEFAULT_WORKER_ID }});
         result = await handleIt2Cmd(job);
+        // await logEventSafe({ trace_id: job.trace_id, job_id: job.id, stage: "it2.decide", ok: !!result.ok, message: "IT2_DECIDE", payload:{ actor:"worker", worker_id: DEFAULT_WORKER_ID, result }});
       } else if (job.type === "it1_job") {
         // TODO: 실제 it1 실행 로직(n8n 호출 등)로 교체 예정
         // 지금은 STUB
+        // (선택) stage 사용 시:
+        // await logEventSafe({ trace_id: job.trace_id, job_id: job.id, stage:"it1.started", ok:true, message:"IT1_STARTED", payload:{ actor:"worker", worker_id: DEFAULT_WORKER_ID }});
         result = { ok: true, note: "stub_done" };
+        // await logEventSafe({ trace_id: job.trace_id, job_id: job.id, stage:"it1.done", ok:true, message:"IT1_DONE", payload:{ actor:"worker", worker_id: DEFAULT_WORKER_ID, result }});
       } else {
         // 알 수 없는 타입은 실패 처리
         result = { ok: false, error: "UNKNOWN_JOB_TYPE", detail: job.type };
