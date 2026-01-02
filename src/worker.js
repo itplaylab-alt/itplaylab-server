@@ -1,75 +1,42 @@
-// src/worker.js
-// 서버에서 /next-job 요청이 올 때 한 번만 Job을 뽑아오고,
-// job.type 기준으로 실제 처리 후 DONE/FAILED 로 업데이트하는 로직
-
+// src/worker.js (NEW) - DB 접근 0, API 계약 기반 Worker
 import crypto from "crypto";
-import { createClient } from "@supabase/supabase-js";
-
-import { popNextJobForWorker, markJobDone, markJobFailed } from "./jobRepo.js";
 import { tgSend, tg2Send } from "../services/telegramBot.js";
 
-const DEFAULT_WORKER_ID = process.env.WORKER_ID || "itplaylab-worker-1";
+const NEXT_JOB_URL = process.env.NEXT_JOB_URL;
+const EVENT_LOG_URL = process.env.EVENT_LOG_URL;
+const JOBQUEUE_WORKER_SECRET = process.env.JOBQUEUE_WORKER_SECRET;
+const EVENT_LOG_SECRET = process.env.EVENT_LOG_SECRET;
+const WORKER_ID = process.env.WORKER_ID || "itplaylab-worker-1";
 
-// ✅ Supabase 클라이언트 (worker에서도 직접 사용)
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
+const IT2_AUTO_DECIDE_URL = process.env.IT2_AUTO_DECIDE_URL; // 선택
 
-// ─────────────────────────────────────────
-// event_log (원장) 기록 유틸  ✅ Step6: claimed를 여기서 찍기
-// ─────────────────────────────────────────
-async function logEventSafe({
-  trace_id,
-  job_id,
-  stage,
-  ok,
-  latency_ms = null,
-  message = "",
-  payload = {},
-  idempotency_key = null,
-}) {
+const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || 20000);
+const NEXTJOB_TIMEOUT_MS = Number(process.env.NEXTJOB_TIMEOUT_MS || 15000);
+const EVENT_TIMEOUT_MS = Number(process.env.EVENT_TIMEOUT_MS || 15000);
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function jitter(ms, ratio = 0.15) {
+  const d = ms * ratio;
+  return Math.max(0, Math.floor(ms - d + Math.random() * (2 * d)));
+}
+
+async function timedFetch(url, options, timeoutMs) {
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), timeoutMs);
   try {
-    // ⚠️ 권장: event_log에 idempotency_key 컬럼 + unique index가 있어야 중복 방지가 완벽
-    // create unique index if not exists event_log_idempotency_key_uniq
-    // on event_log (idempotency_key) where idempotency_key is not null;
-
-    const row = {
-      trace_id: trace_id ?? "no-trace",
-      job_id: job_id ?? null,
-      stage,
-      ok: !!ok,
-      latency_ms,
-      message,
-      payload,
-      idempotency_key,
-      created_at: new Date().toISOString(),
-    };
-
-    // ✅ 중복 방지: idempotency_key 기준 upsert (중복이면 무시)
-    if (idempotency_key) {
-      const { error } = await supabase
-        .from("event_log")
-        .upsert(row, { onConflict: "idempotency_key", ignoreDuplicates: true });
-
-      if (error) {
-        console.warn("[event_log] upsert failed:", error.message);
-      }
-      return;
-    }
-
-    const { error } = await supabase.from("event_log").insert(row);
-    if (error) {
-      console.warn("[event_log] insert failed:", error.message);
-    }
-  } catch (e) {
-    console.warn("[event_log] exception:", e?.message || String(e));
+    return await fetch(url, { ...options, signal: ac.signal });
+  } finally {
+    clearTimeout(t);
   }
 }
 
-// ─────────────────────────────────────────
-// 유틸
-// ─────────────────────────────────────────
+function idem(jobId, eventType, attempt, extra = "") {
+  return `${jobId}:${eventType}:${attempt}${extra ? ":" + extra : ""}`;
+}
+
+// ----------------------
+// Telegram notify (기존 유지)
+// ----------------------
 function pickJobNamespace(job) {
   return (
     job?.params?.namespace ??
@@ -77,484 +44,191 @@ function pickJobNamespace(job) {
     (job?.type === "it2_cmd" ? "it2" : "it1")
   );
 }
-
 function pickJobChatId(job) {
-  return (
-    job?.params?.meta?.chat_id ??
-    job?.params?.meta?.chatId ??
-    job?.chat_id ??
-    null
-  );
+  return job?.params?.meta?.chat_id ?? job?.params?.meta?.chatId ?? job?.chat_id ?? null;
 }
-
 async function notifyJob(job, text) {
   const chatId = pickJobChatId(job);
   if (!chatId) return;
-
   const ns = pickJobNamespace(job);
   return ns === "it2" ? tg2Send(chatId, text) : tgSend(chatId, text);
 }
 
-const nowISO = () => new Date().toISOString();
-const genRunId = () => `it2_${Date.now()}_${crypto.randomBytes(3).toString("hex")}`;
-
-function kstDateISO(d = new Date()) {
-  // KST(UTC+9) 기준 YYYY-MM-DD
-  const utc = d.getTime() + d.getTimezoneOffset() * 60000;
-  const kst = new Date(utc + 9 * 60 * 60000);
-  return kst.toISOString().slice(0, 10);
+// ----------------------
+// API calls
+// ----------------------
+async function nextJob() {
+  const res = await timedFetch(
+    NEXT_JOB_URL,
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "authorization": `Bearer ${JOBQUEUE_WORKER_SECRET}`,
+      },
+      body: JSON.stringify({ worker_id: WORKER_ID, capabilities: ["it1","it2"], prefetch: 1 }),
+    },
+    NEXTJOB_TIMEOUT_MS
+  );
+  if (!res.ok) throw new Error(`POST /next-job failed: ${res.status} ${await res.text().catch(()=> "")}`);
+  return res.json();
 }
 
-// ✅ auto-decide 호출(후콜) 유틸
+async function postEvent(evt) {
+  const res = await timedFetch(
+    EVENT_LOG_URL,
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "authorization": `Bearer ${EVENT_LOG_SECRET}`,
+      },
+      body: JSON.stringify(evt),
+    },
+    EVENT_TIMEOUT_MS
+  );
+  if (!res.ok) throw new Error(`POST /event failed: ${res.status} ${await res.text().catch(()=> "")}`);
+  return res.json().catch(() => ({ ok: true }));
+}
+
+// ----------------------
+// it2 호출(Worker가 계산하지 말고 HTTP로만)
+// ----------------------
 async function callAutoDecide(payload) {
-  const url = process.env.IT2_AUTO_DECIDE_URL;
-  if (!url) {
-    console.warn("[auto-decide] IT2_AUTO_DECIDE_URL not set");
-    return;
-  }
+  if (!IT2_AUTO_DECIDE_URL) return { ok: true, skipped: true, reason: "IT2_AUTO_DECIDE_URL not set" };
 
-  // Node 18+ fetch 내장 / 하위버전 보완
-  let _fetch = globalThis.fetch;
-  if (!_fetch) {
-    const mod = await import("node-fetch");
-    _fetch = mod.default;
-  }
+  const res = await timedFetch(
+    IT2_AUTO_DECIDE_URL,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+    10000
+  );
 
-  // 10초 타임아웃
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), 10_000);
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: "IT2_HTTP_FAIL", detail: { status: res.status, json } };
+  return { ok: true, data: json };
+}
+
+// ----------------------
+// 실제 실행부 (여기만 너의 실제 로직으로 교체)
+// ----------------------
+async function runIt1(job) {
+  // TODO: n8n / PowerShell / Render 등 실제 실행
+  await sleep(1500 + Math.floor(Math.random() * 1500));
+  return { ok: true, note: "stub_done", out: { job_id: job.id } };
+}
+
+async function runJob(jobEnvelope) {
+  const job = jobEnvelope.job;
+  const attempt = jobEnvelope.attempt ?? job.attempt ?? 1;
+  const trace_id = job.payload?.trace_id ?? job.trace_id ?? `tr_${job.id}`;
+
+  const baseEvt = {
+    trace_id,
+    job_id: job.id,
+    job_type: job.type,
+    worker_id: WORKER_ID,
+    attempt,
+  };
+
+  const startedAt = Date.now();
+  let hbSeq = 0;
+  let hbTimer = null;
 
   try {
-    const res = await _fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
+    await postEvent({
+      ...baseEvt,
+      event_type: "job.started",
+      ts: new Date().toISOString(),
+      idempotency_key: idem(job.id, "job.started", attempt),
+      data: { status: "running" },
     });
 
-    const json = await res.json().catch(() => null);
+    hbTimer = setInterval(() => {
+      hbSeq += 1;
+      postEvent({
+        ...baseEvt,
+        event_type: "job.heartbeat",
+        ts: new Date().toISOString(),
+        idempotency_key: idem(job.id, "job.heartbeat", attempt, String(hbSeq)),
+        data: { stage: "running", elapsed_ms: Date.now() - startedAt },
+      }).catch(() => {});
+    }, HEARTBEAT_MS);
 
-    if (!res.ok) {
-      console.warn("[auto-decide] non-200", res.status, json);
-      return;
-    }
+    let result;
 
-    console.log(
-      "[LOG]",
-      JSON.stringify({
-        event: "worker.auto_decide_called",
-        ok: true,
-        trace_id: payload?.trace_id,
-      })
-    );
-  } catch (e) {
-    console.warn("[auto-decide] failed", e?.message || String(e));
-    console.log(
-      "[LOG]",
-      JSON.stringify({
-        event: "worker.auto_decide_failed",
-        ok: false,
-        trace_id: payload?.trace_id,
-        error: e?.message || String(e),
-      })
-    );
-  } finally {
-    clearTimeout(t);
-  }
-}
-
-// ─────────────────────────────────────────
-// ✅ it2 최소 실행 로직 (MVP)
-// ─────────────────────────────────────────
-async function it2HealthCheck() {
-  // 1) risk_snapshot_daily 테이블 조회 가능 여부
-  const a = await supabase
-    .from("risk_snapshot_daily")
-    .select("snapshot_date, portfolio_id")
-    .order("snapshot_date", { ascending: false })
-    .limit(1);
-
-  if (a.error) {
-    return { ok: false, error: "RISK_SNAPSHOT_TABLE_ERROR", detail: a.error.message };
-  }
-
-  // 2) self_learning_log 테이블 조회 가능 여부
-  const b = await supabase
-    .from("self_learning_log")
-    .select("event_ts, event_type")
-    .order("event_ts", { ascending: false })
-    .limit(1);
-
-  if (b.error) {
-    return { ok: false, error: "SELF_LEARNING_TABLE_ERROR", detail: b.error.message };
-  }
-
-  return {
-    ok: true,
-    tables: {
-      risk_snapshot_daily: true,
-      self_learning_log: true,
-    },
-    latest_snapshot: a.data?.[0] ?? null,
-    latest_log: b.data?.[0] ?? null,
-  };
-}
-
-// ✅ 여기만 나중에 “진짜 리스크 계산”으로 교체하면 됨
-function computeDemoRiskSnapshot({ snapshot_date, portfolio_id }) {
-  // 데모 값(파이프라인 검증용)
-  const risk_score = 0.35 + Math.random() * 0.3; // 0.35~0.65
-  return {
-    snapshot_date,
-    portfolio_id,
-    engine_version: "v1",
-    run_id: genRunId(),
-
-    risk_score: Number(risk_score.toFixed(4)),
-    risk_level: risk_score > 0.55 ? 3 : risk_score > 0.45 ? 2 : 1,
-
-    features: { source: "demo", snapshot_date, portfolio_id },
-    positions_summary: { items: [] },
-
-    ok: true,
-    latency_ms: null,
-    notes: "demo snapshot",
-    updated_at: nowISO(),
-  };
-}
-
-async function it2SnapshotRun({ args, trace_id }) {
-  const snapshot_date = args.snapshot_date || kstDateISO();
-  const portfolio_id = args.portfolio_id || "default";
-  const engine_version = args.engine_version || "v1";
-  const dry_run = !!args.dry_run;
-  const force = !!args.force;
-
-  // force=false면 기존 스냅샷 있으면 스킵하는 것도 가능
-  if (!force && !dry_run) {
-    const exists = await supabase
-      .from("risk_snapshot_daily")
-      .select("snapshot_date")
-      .eq("snapshot_date", snapshot_date)
-      .eq("portfolio_id", portfolio_id)
-      .limit(1);
-
-    if (!exists.error && (exists.data?.length ?? 0) > 0) {
-      return { ok: true, skipped: true, reason: "already_exists", snapshot_date, portfolio_id };
-    }
-  }
-
-  const snap = computeDemoRiskSnapshot({ snapshot_date, portfolio_id });
-  snap.engine_version = engine_version;
-
-  // 1) decision 로그
-  if (!dry_run) {
-    const insDecision = await supabase.from("self_learning_log").insert({
-      portfolio_id,
-      snapshot_date,
-      engine_version,
-      trace_id,
-      run_id: snap.run_id,
-      event_type: "decision",
-      input_features: snap.features,
-      decision_payload: { rule: "demo_v1", computed: true },
-      ok: true,
-      latency_ms: null,
-      created_at: nowISO(),
-    });
-
-    if (insDecision.error) {
-      return { ok: false, error: "DECISION_LOG_INSERT_FAIL", detail: insDecision.error.message };
-    }
-  }
-
-  // 2) 스냅샷 UPSERT
-  if (!dry_run) {
-    const up = await supabase.from("risk_snapshot_daily").upsert(
-      {
-        snapshot_date: snap.snapshot_date,
-        portfolio_id: snap.portfolio_id,
-        engine_version: snap.engine_version,
-        run_id: snap.run_id,
-        risk_score: snap.risk_score,
-        risk_level: snap.risk_level,
-        features: snap.features,
-        positions_summary: snap.positions_summary,
-        notes: snap.notes,
-        ok: true,
-        updated_at: nowISO(),
-      },
-      { onConflict: "snapshot_date,portfolio_id" }
-    );
-
-    if (up.error) {
-      return { ok: false, error: "SNAPSHOT_UPSERT_FAIL", detail: up.error.message };
-    }
-  }
-
-  // 3) result 로그
-  if (!dry_run) {
-    const insResult = await supabase.from("self_learning_log").insert({
-      portfolio_id,
-      snapshot_date,
-      engine_version,
-      trace_id,
-      run_id: snap.run_id,
-      event_type: "result",
-      outcome_payload: { upserted: true },
-      kpi: { risk_score: snap.risk_score, risk_level: snap.risk_level },
-      reward: null,
-      ok: true,
-      latency_ms: null,
-      created_at: nowISO(),
-    });
-
-    if (insResult.error) {
-      return { ok: false, error: "RESULT_LOG_INSERT_FAIL", detail: insResult.error.message };
-    }
-  }
-
-  return {
-    ok: true,
-    dry_run,
-    force,
-    snapshot_date,
-    portfolio_id,
-    metrics: { risk_score: snap.risk_score, risk_level: snap.risk_level },
-  };
-}
-
-async function handleIt2Cmd(job) {
-  const payload = job.params || {};
-  const cmd = payload.cmd;
-  const args = payload.args || {};
-  const trace_id = job.trace_id;
-
-  if (!cmd) return { ok: false, error: "NO_CMD_IN_PARAMS" };
-
-  if (cmd === "health.check") return await it2HealthCheck();
-  if (cmd === "snapshot.run") return await it2SnapshotRun({ args, trace_id });
-
-  if (cmd === "snapshot.backfill") {
-    const days = Number(args.days ?? 7);
-    const portfolio_id = args.portfolio_id || "default";
-    const engine_version = args.engine_version || "v1";
-    const dry_run = !!args.dry_run;
-    const force = !!args.force;
-
-    const results = [];
-    for (let i = 0; i < days; i++) {
-      const d = new Date();
-      d.setDate(d.getDate() - i);
-      const snapshot_date = kstDateISO(d);
-
-      const r = await it2SnapshotRun({
-        args: { snapshot_date, portfolio_id, engine_version, dry_run, force },
+    if (job.type === "it1_job" || job.type === "it1.render") {
+      result = await runIt1(job);
+      // 필요하면 it2 후콜
+      await callAutoDecide({
         trace_id,
+        job_id: job.id,
+        job_type: job.type,
+        ok: !!result?.ok,
+        result,
+      }).catch(() => {});
+    } else if (job.type === "it2_cmd") {
+      // it2_cmd도 Worker에서 DB 계산하지 말고 it2로 넘겨라
+      const payload = job.params || job.payload || {};
+      result = await callAutoDecide({ trace_id, job_id: job.id, job_type: job.type, cmd: payload.cmd, args: payload.args });
+    } else {
+      result = { ok: false, error: "UNKNOWN_JOB_TYPE", detail: job.type };
+    }
+
+    const latency_ms = Date.now() - startedAt;
+
+    if (result?.ok) {
+      await postEvent({
+        ...baseEvt,
+        event_type: "job.succeeded",
+        ts: new Date().toISOString(),
+        idempotency_key: idem(job.id, "job.succeeded", attempt),
+        data: { output: result, latency_ms },
       });
 
-      results.push({ snapshot_date, ok: r.ok, skipped: r.skipped || false });
-      if (!r.ok) return { ok: false, error: "BACKFILL_FAILED", detail: r };
+      await notifyJob(job, `✅ 작업 완료\ntype: ${job.type}\ntrace_id: ${trace_id}\nlatency_ms: ${latency_ms}`);
+    } else {
+      await postEvent({
+        ...baseEvt,
+        event_type: "job.failed",
+        ts: new Date().toISOString(),
+        idempotency_key: idem(job.id, "job.failed", attempt),
+        data: {
+          error: { code: "PROCESS_FAIL", message: result?.error || "PROCESS_FAIL", detail: result?.detail ?? null },
+          retryable: true,
+          latency_ms,
+        },
+      });
+
+      await notifyJob(job, `❌ 작업 실패\ntype: ${job.type}\ntrace_id: ${trace_id}\nerror: ${result?.error || "PROCESS_FAIL"}`);
     }
 
-    return { ok: true, backfill_days: days, portfolio_id, results };
+  } finally {
+    if (hbTimer) clearInterval(hbTimer);
   }
-
-  if (cmd === "score.v1") {
-    const snapshot_date = args.snapshot_date || kstDateISO();
-    const portfolio_id = args.portfolio_id || "default";
-    const snap = computeDemoRiskSnapshot({ snapshot_date, portfolio_id });
-    return {
-      ok: true,
-      snapshot_date,
-      portfolio_id,
-      metrics: { risk_score: snap.risk_score, risk_level: snap.risk_level },
-    };
-  }
-
-  return { ok: false, error: "UNKNOWN_CMD", cmd };
 }
 
-// ─────────────────────────────────────────
-// Worker 메인
-// ─────────────────────────────────────────
-export async function runWorkerOnce() {
-  const startedAt = Date.now();
+// ----------------------
+// Worker loop (Step 7 핵심)
+// ----------------------
+export async function runWorkerLoop() {
+  if (!NEXT_JOB_URL || !EVENT_LOG_URL || !JOBQUEUE_WORKER_SECRET || !EVENT_LOG_SECRET) {
+    throw new Error("Missing env: NEXT_JOB_URL, EVENT_LOG_URL, JOBQUEUE_WORKER_SECRET, EVENT_LOG_SECRET");
+  }
 
-  try {
-    // 1) 다음 PENDING job 하나 가져오기 (락은 jobRepo에서)
-    const job = await popNextJobForWorker(DEFAULT_WORKER_ID);
+  while (true) {
+    const envelope = await nextJob();
 
-    // 2) Job 없으면 종료
-    if (!job) {
-      console.log(
-        '[LOG] {"event":"worker.no_job","ok":true,"message":"대기 Job 없음","meta":{}}'
-      );
-      return { has_job: false, job: null };
+    if (!envelope.job) {
+      const wait = envelope.backoff_ms ?? 1000;
+      await sleep(jitter(wait, 0.15));
+      continue;
     }
 
-    // ✅ Step 6-2: "진짜 실행 시작" 순간에만 job.claimed 기록
-    // - /next-job에서는 절대 기록하지 않음
-    // - idempotency_key로 중복 방지
-    await logEventSafe({
-      trace_id: job.trace_id || "unknown_trace",
-      job_id: job.id || null,
-      stage: "job.claimed",
-      ok: true,
-      latency_ms: Date.now() - startedAt,
-      message: "CLAIMED",
-      idempotency_key: job?.id ? `job.claimed:${job.id}` : null,
-      payload: {
-        actor: "worker",
-        worker_id: DEFAULT_WORKER_ID,
-        type: job.type ?? null,
-        status: job.status ?? null,
-        locked_at: job.locked_at ?? null,
-        locked_by: job.locked_by ?? null,
-      },
-    });
-
-    console.log(
-      "[LOG]",
-      JSON.stringify({
-        event: "worker.job_found",
-        ok: true,
-        id: job.id,
-        trace_id: job.trace_id,
-        type: job.type,
-        status: job.status,
-      })
-    );
-
-    // 3) 실제 작업 처리
-    try {
-      let result = { ok: true };
-
-      // ✅ type 분기
-      if (job.type === "it2_cmd") {
-        // (선택) stage를 더 엄격히 쓰고 싶으면 아래 2줄 활성화 가능
-        // await logEventSafe({ trace_id: job.trace_id, job_id: job.id, stage: "it2.received", ok: true, message: "IT2_RECEIVED", payload:{ actor:"worker", worker_id: DEFAULT_WORKER_ID }});
-        result = await handleIt2Cmd(job);
-        // await logEventSafe({ trace_id: job.trace_id, job_id: job.id, stage: "it2.decide", ok: !!result.ok, message: "IT2_DECIDE", payload:{ actor:"worker", worker_id: DEFAULT_WORKER_ID, result }});
-      } else if (job.type === "it1_job") {
-        // TODO: 실제 it1 실행 로직(n8n 호출 등)로 교체 예정
-        // 지금은 STUB
-        // (선택) stage 사용 시:
-        // await logEventSafe({ trace_id: job.trace_id, job_id: job.id, stage:"it1.started", ok:true, message:"IT1_STARTED", payload:{ actor:"worker", worker_id: DEFAULT_WORKER_ID }});
-        result = { ok: true, note: "stub_done" };
-        // await logEventSafe({ trace_id: job.trace_id, job_id: job.id, stage:"it1.done", ok:true, message:"IT1_DONE", payload:{ actor:"worker", worker_id: DEFAULT_WORKER_ID, result }});
-      } else {
-        // 알 수 없는 타입은 실패 처리
-        result = { ok: false, error: "UNKNOWN_JOB_TYPE", detail: job.type };
-      }
-
-      const latency_ms = Date.now() - startedAt;
-
-      // 결과 로그(표준)
-      console.log(
-        "[LOG]",
-        JSON.stringify({
-          event: "worker.job_result",
-          ok: !!result.ok,
-          id: job.id,
-          trace_id: job.trace_id,
-          type: job.type,
-          latency_ms,
-          result,
-        })
-      );
-
-      if (result.ok) {
-        await markJobDone(job.id);
-
-        // ✅ 핵심: it1_job 성공 시 auto-decide 후콜(payload로)
-        if (job.type === "it1_job") {
-          await callAutoDecide({
-            trace_id: job.trace_id,
-            job_id: job.id,
-            job_type: job.type,
-            ok: true,
-            latency_ms,
-            result,
-            error: null,
-          });
-        }
-
-        await notifyJob(
-          job,
-          `✅ 작업 완료\ntype: ${job.type}\ntrace_id: ${job.trace_id}\nlatency_ms: ${latency_ms}${
-            result?.skipped ? "\n(skipped)" : ""
-          }`
-        );
-      } else {
-        await markJobFailed(job.id, result.error || "PROCESS_FAIL");
-
-        // ✅ (권장) it1_job 실패도 auto-decide로 전달하면 retry/fork 판단 가능
-        if (job.type === "it1_job") {
-          await callAutoDecide({
-            trace_id: job.trace_id,
-            job_id: job.id,
-            job_type: job.type,
-            ok: false,
-            latency_ms,
-            result: null,
-            error: { message: result.error || "PROCESS_FAIL", detail: result.detail ?? null },
-          });
-        }
-
-        await notifyJob(
-          job,
-          `❌ 작업 실패\ntype: ${job.type}\ntrace_id: ${job.trace_id}\nerror: ${
-            result.error || "PROCESS_FAIL"
-          }`
-        );
-      }
-    } catch (procErr) {
-      const latency_ms = Date.now() - startedAt;
-
-      console.error(
-        "[LOG]",
-        JSON.stringify({
-          event: "worker.process_error",
-          ok: false,
-          id: job.id,
-          trace_id: job.trace_id,
-          type: job.type,
-          error: procErr?.message || String(procErr),
-        })
-      );
-
-      await markJobFailed(job.id, procErr?.message || String(procErr));
-
-      // ✅ (권장) it1_job 예외도 auto-decide로 전달
-      if (job.type === "it1_job") {
-        await callAutoDecide({
-          trace_id: job.trace_id,
-          job_id: job.id,
-          job_type: job.type,
-          ok: false,
-          latency_ms,
-          result: null,
-          error: { message: procErr?.message || String(procErr) },
-        });
-      }
-
-      await notifyJob(
-        job,
-        `❌ 작업 처리 중 예외\ntrace_id: ${job.trace_id}\n${procErr?.message || String(procErr)}`
-      );
-    }
-
-    return { has_job: true, job };
-  } catch (e) {
-    console.error(
-      "[LOG]",
-      JSON.stringify({
-        event: "worker.error",
-        ok: false,
-        error: e?.message || String(e),
-      })
-    );
-    throw e;
+    await runJob(envelope);
+    await sleep(jitter(80, 0.5));
   }
 }
