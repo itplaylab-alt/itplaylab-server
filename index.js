@@ -39,7 +39,7 @@ import {
 import { startVideoGeneration } from "./src/videoFactoryClient.js";
 
 // ─────────────────────────────────────────
-// Supabase 클라이언트 (job_queue용)
+// Supabase 클라이언트 (job_queue/event_log용)
 // ─────────────────────────────────────────
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -81,13 +81,9 @@ async function logEvent({
 // 서버 준비
 // ─────────────────────────────────────────
 const app = express();
-app.use((req, res, next) => {
-  console.log("[REQ]", req.method, req.url);
-  next();
-});
 app.use(express.json({ limit: "1mb", type: ["application/json"] }));
 
-// /next-job 로그 최소화 옵션
+// /next-job 로그 최소화 옵션 (요청 로그는 여기서만 처리하도록 단일화)
 let lastJobLogAt = 0;
 app.use((req, res, next) => {
   if (req.path === "/next-job") {
@@ -115,9 +111,9 @@ app.post("/it2/auto-decide", async (req, res) => {
   const expected = CONFIG.JOBQUEUE_ENQUEUE_SECRET || "";
 
   if (!expected || secret !== expected) {
-    // (선택) 인증 실패도 원장에 남기고 싶으면 trace_id가 있을 때만 기록
     const trace = req.body?.trace_id;
     const jobId = req.body?.job_id ?? null;
+
     if (trace) {
       await logEvent({
         trace_id: trace,
@@ -125,7 +121,7 @@ app.post("/it2/auto-decide", async (req, res) => {
         stage: "it2_unauthorized",
         ok: false,
         message: "UNAUTHORIZED_AUTO_DECIDE",
-        payload: { path: req.originalUrl || req.url },
+        payload: { actor: "api", path: req.originalUrl || req.url },
       });
     }
 
@@ -165,6 +161,7 @@ app.post("/it2/auto-decide", async (req, res) => {
     latency_ms: typeof latency_ms === "number" ? latency_ms : null,
     message: "auto-decide received",
     payload: {
+      actor: "it2",
       job_type,
       ok,
       has_result: !!result,
@@ -185,7 +182,6 @@ app.post("/it2/auto-decide", async (req, res) => {
     if (lockErr) {
       console.error("[it2.auto-decide] lockErr:", lockErr);
 
-      // ✅ (4) 에러 로그
       await logEvent({
         trace_id,
         job_id,
@@ -193,7 +189,7 @@ app.post("/it2/auto-decide", async (req, res) => {
         ok: false,
         latency_ms: Date.now() - t0,
         message: "LOCK_FAILED",
-        payload: { detail: lockErr.message },
+        payload: { actor: "it2", detail: lockErr.message },
       });
 
       return res
@@ -202,7 +198,6 @@ app.post("/it2/auto-decide", async (req, res) => {
     }
 
     if (!locked) {
-      // 이미 처리됨 (중복 방지)
       console.log(
         "[LOG]",
         JSON.stringify({
@@ -213,7 +208,6 @@ app.post("/it2/auto-decide", async (req, res) => {
         })
       );
 
-      // ✅ (2) 스킵 로그: dedup
       await logEvent({
         trace_id,
         job_id,
@@ -221,7 +215,7 @@ app.post("/it2/auto-decide", async (req, res) => {
         ok: true,
         latency_ms: Date.now() - t0,
         message: "DEDUP",
-        payload: { reason: "auto_decided_at already set" },
+        payload: { actor: "it2", reason: "auto_decided_at already set" },
       });
 
       return res.json({ ok: true, decision: "DEDUP", enqueued: 0 });
@@ -238,9 +232,7 @@ app.post("/it2/auto-decide", async (req, res) => {
 
     if (cntErr) {
       console.error("[it2.auto-decide] cntErr:", cntErr);
-      // count 업데이트 실패해도, lock은 걸렸으니 일단 진행은 가능
 
-      // (선택) 경고 로그
       await logEvent({
         trace_id,
         job_id,
@@ -248,13 +240,11 @@ app.post("/it2/auto-decide", async (req, res) => {
         ok: true,
         latency_ms: Date.now() - t0,
         message: "AUTO_DECIDE_COUNT_UPDATE_FAILED",
-        payload: { detail: cntErr.message },
+        payload: { actor: "it2", detail: cntErr.message },
       });
     }
 
     // 3) decision rule (MVP)
-    // - ok=false이면 retry job 생성 (최대 N회)
-    // - ok=true이면 NOOP (추후 KPI 기반 FORK 추가)
     const retryMax = Number(process.env.AUTO_DECIDE_RETRY_MAX ?? 2);
 
     let decision = "NOOP";
@@ -263,7 +253,6 @@ app.post("/it2/auto-decide", async (req, res) => {
     if (ok === false && nextCount <= retryMax) {
       decision = "RETRY";
 
-      // ✅ 여기 cmd/args는 너희 it1 규격에 맞게 언제든 교체 가능
       const params = {
         namespace: "it1",
         meta: { source: "auto-decide", parent_job_id: job_id },
@@ -276,7 +265,7 @@ app.post("/it2/auto-decide", async (req, res) => {
         .insert({
           type: "it1_job",
           status: "PENDING",
-          trace_id, // trace 유지 (원하면 새 trace 발급도 가능)
+          trace_id,
           params,
           locked_at: null,
           locked_by: null,
@@ -289,7 +278,6 @@ app.post("/it2/auto-decide", async (req, res) => {
       if (insErr) {
         console.error("[it2.auto-decide] enqueue retry fail:", insErr);
 
-        // ✅ (4) 에러 로그
         await logEvent({
           trace_id,
           job_id,
@@ -297,7 +285,7 @@ app.post("/it2/auto-decide", async (req, res) => {
           ok: false,
           latency_ms: Date.now() - t0,
           message: "ENQUEUE_FAIL",
-          payload: { detail: insErr.message },
+          payload: { actor: "it2", detail: insErr.message },
         });
 
         return res
@@ -307,7 +295,6 @@ app.post("/it2/auto-decide", async (req, res) => {
 
       enqueued = 1;
 
-      // (선택) enqueue 상세 로그
       await logEvent({
         trace_id,
         job_id,
@@ -315,7 +302,7 @@ app.post("/it2/auto-decide", async (req, res) => {
         ok: true,
         latency_ms: Date.now() - t0,
         message: "ENQUEUED_IT1_RETRY",
-        payload: { enqueued_job_id: insData?.id ?? null, attempt: nextCount },
+        payload: { actor: "it2", enqueued_job_id: insData?.id ?? null, attempt: nextCount },
       });
     }
 
@@ -333,7 +320,6 @@ app.post("/it2/auto-decide", async (req, res) => {
       })
     );
 
-    // ✅ (3) 출구 로그: 결정 완료
     await logEvent({
       trace_id,
       job_id,
@@ -342,6 +328,7 @@ app.post("/it2/auto-decide", async (req, res) => {
       latency_ms: Date.now() - t0,
       message: decision,
       payload: {
+        actor: "it2",
         decision,
         enqueued,
         auto_decide_count: nextCount,
@@ -354,7 +341,6 @@ app.post("/it2/auto-decide", async (req, res) => {
   } catch (e) {
     console.error("[it2.auto-decide] exception:", e);
 
-    // ✅ (4) 예외 로그
     await logEvent({
       trace_id,
       job_id,
@@ -362,7 +348,7 @@ app.post("/it2/auto-decide", async (req, res) => {
       ok: false,
       latency_ms: Date.now() - t0,
       message: "AUTO_DECIDE_EXCEPTION",
-      payload: { detail: e?.message || String(e) },
+      payload: { actor: "it2", detail: e?.message || String(e) },
     });
 
     return res.status(500).json({
@@ -381,7 +367,6 @@ const nowISO = () => new Date().toISOString();
 
 // ─────────────────────────────────────────
 // ✅ it2 전용 텔레그램 sender (별도 봇 토큰)
-//   - Render env: TELEGRAM_IT2_BOT_TOKEN 설정 필요
 // ─────────────────────────────────────────
 const IT2_BOT_TOKEN =
   process.env.TELEGRAM_IT2_BOT_TOKEN || CONFIG.TELEGRAM_IT2_BOT_TOKEN || "";
@@ -411,7 +396,7 @@ async function tg2Send(chatId, text, extra = {}) {
 // ─────────────────────────────────────────
 const mask4 = (v = "") => (v ? String(v).slice(0, 4) : "");
 const buildAuthDiag = ({ kind, expected, got }) => ({
-  kind, // "WORKER" | "ENQUEUER"
+  kind,
   expected_prefix: mask4(expected),
   got_prefix: mask4(got),
   hint:
@@ -448,17 +433,10 @@ function parseKeyValues(parts) {
   return args;
 }
 
-/**
- * 예시:
- *  /it2 health
- *  /it2 snapshot run date=2025-12-12 portfolio=demo force=true
- *  /it2 backfill days=30 portfolio=demo
- *  /it2 score v1 date=2025-12-12 portfolio=demo dry_run=true
- */
 function buildIt2CommandPayload(text, { trace_id, chat_id }) {
   const tokens = text.trim().split(/\s+/);
-  const group = tokens[1] || ""; // health | snapshot | backfill | score
-  const action = tokens[2] || ""; // run | check | v1 ...
+  const group = tokens[1] || "";
+  const action = tokens[2] || "";
   const kv = parseKeyValues(tokens.slice(3));
 
   let cmd = null;
@@ -714,6 +692,21 @@ app.post("/enqueue-job", async (req, res) => {
       return res.status(500).json({ ok: false, error: "DB_ERROR" });
     }
 
+    // ✅ event_log: job.enqueued (입고 기록)
+    await logEvent({
+      trace_id: data.trace_id,
+      job_id: data.id,
+      stage: "job.enqueued",
+      ok: true,
+      message: "ENQUEUED",
+      payload: {
+        actor: "api",
+        type: data.type,
+        status: data.status,
+        chat_id: data.chat_id ?? null,
+      },
+    });
+
     return res.json({ ok: true, job: data });
   } catch (e) {
     console.error("[ENQUEUE-JOB] INTERNAL_ERROR", e);
@@ -754,19 +747,52 @@ app.post("/next-job", async (req, res) => {
   }
 
   try {
+    const t0 = Date.now();
     const result = await runWorkerOnce();
+    const latency = Date.now() - t0;
 
     if (!result || !result.has_job || !result.job) {
       return res.json({ ok: true, has_job: false });
     }
 
+    const job = result.job;
+
+    // ✅ event_log: job.claimed
+    // has_job=true일 때만 기록 (폴링 폭발 방지)
+    await logEvent({
+      trace_id: job.trace_id || "unknown_trace",
+      job_id: job.id || null,
+      stage: "job.claimed",
+      ok: true,
+      latency_ms: latency,
+      message: "CLAIMED",
+      payload: {
+        actor: "api",
+        type: job.type ?? null,
+        status: job.status ?? null,
+        locked_at: job.locked_at ?? null,
+        locked_by: job.locked_by ?? null,
+      },
+    });
+
     return res.json({
       ok: true,
       has_job: true,
-      job: result.job,
+      job,
     });
   } catch (e) {
     console.error("[NEXT-JOB] 🧨 error:", e);
+
+    // (선택) 원장에 남기고 싶으면 - trace_id가 없어서 no-trace로만 기록
+    await logEvent({
+      trace_id: "no-trace",
+      job_id: null,
+      stage: "job.claim.error",
+      ok: false,
+      message: e?.message || "INTERNAL_ERROR",
+      payload: { actor: "api" },
+    });
+
     return res
       .status(500)
       .json({ ok: false, error: e?.message || "INTERNAL_ERROR" });
