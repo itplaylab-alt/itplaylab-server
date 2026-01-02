@@ -404,6 +404,8 @@ export async function runWorkerLoop() {
   while (!STOP) {
     try {
       const envelope = await nextJob();
+      console.log('[DEBUG] next-job envelope:', JSON.stringify(envelope, null, 2));
+
 
       // 서버가 내려준 backoff 우선
       if (!envelope?.job) {
