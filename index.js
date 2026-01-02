@@ -757,23 +757,8 @@ app.post("/next-job", async (req, res) => {
 
     const job = result.job;
 
-    // ✅ event_log: job.claimed
-    // has_job=true일 때만 기록 (폴링 폭발 방지)
-    await logEvent({
-      trace_id: job.trace_id || "unknown_trace",
-      job_id: job.id || null,
-      stage: "job.claimed",
-      ok: true,
-      latency_ms: latency,
-      message: "CLAIMED",
-      payload: {
-        actor: "api",
-        type: job.type ?? null,
-        status: job.status ?? null,
-        locked_at: job.locked_at ?? null,
-        locked_by: job.locked_by ?? null,
-      },
-    });
+    // ⚠️ Step 6: job.claimed는 여기서 기록하지 않음
+    // (runWorkerOnce 내부로 이동)
 
     return res.json({
       ok: true,
@@ -783,11 +768,11 @@ app.post("/next-job", async (req, res) => {
   } catch (e) {
     console.error("[NEXT-JOB] 🧨 error:", e);
 
-    // (선택) 원장에 남기고 싶으면 - trace_id가 없어서 no-trace로만 기록
+    // (선택) API 레벨 에러 로그 (운영 stage 아님)
     await logEvent({
       trace_id: "no-trace",
       job_id: null,
-      stage: "job.claim.error",
+      stage: "system.next_job_error",
       ok: false,
       message: e?.message || "INTERNAL_ERROR",
       payload: { actor: "api" },
